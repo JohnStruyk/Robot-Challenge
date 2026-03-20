@@ -102,7 +102,8 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     camera_intrinsic : numpy.ndarray
         The 3x3 intrinsic camera matrix.
     camera_pose : numpy.ndarray
-        A 4x4 transformation matrix representing the camera's pose in the robot base frame (t_cam_robot).
+        A 4x4 transformation matrix returned by checkpoint0's solvePnP pipeline.
+        In that pipeline, this matrix maps robot/world frame points into the camera frame.
         All translations are in meters.
 
     Returns
@@ -145,9 +146,9 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     t_cam_cube[:3, :3] = cube_tag.pose_R
     t_cam_cube[:3, 3] = cube_tag.pose_t.flatten()
 
-    # camera_pose is t_cam_robot (camera in robot frame), so:
-    # t_robot_cube = t_cam_robot @ t_cam_cube
-    t_robot_cube = camera_pose @ t_cam_cube
+    # checkpoint0 solvePnP output maps robot->camera. We need camera->robot here.
+    t_robot_cam = numpy.linalg.inv(camera_pose)
+    t_robot_cube = t_robot_cam @ t_cam_cube
     return t_robot_cube, t_cam_cube
 
 def main():
@@ -191,6 +192,8 @@ def main():
         if key == ord('k'):
             cv2.destroyAllWindows()
 
+            xyz = t_robot_cube[:3, 3]
+            print(f'Cube in robot frame (m): x={xyz[0]:.3f}, y={xyz[1]:.3f}, z={xyz[2]:.3f}')
             grasp_cube(arm, t_robot_cube)
             place_cube(arm, t_robot_cube)
     
