@@ -143,6 +143,66 @@ class CubePoseDetector:
             mask |= m
         return float(mask.mean())
 
+    def _build_color_mask(self, hsv, target_color):
+        """
+        Build a cleaned binary mask for the target cube color over the full image.
+
+        Parameters
+        ----------
+        hsv : numpy.ndarray
+            HSV image.
+        target_color : str
+            Target color label.
+
+        Returns
+        -------
+        numpy.ndarray
+            uint8 mask with 255 at target-color pixels.
+        """
+        mask = numpy.zeros(hsv.shape[:2], dtype=numpy.uint8)
+        for low, high in self.color_ranges[target_color]:
+            partial = cv2.inRange(hsv, low, high)
+            mask = cv2.bitwise_or(mask, partial)
+
+        # Morphological cleanup: remove speckles and fill small holes.
+        kernel = numpy.ones((5, 5), dtype=numpy.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        return mask
+
+    def _largest_color_centroid(self, hsv, target_color):
+        """
+        Find centroid of the largest connected component for a target cube color.
+
+        Parameters
+        ----------
+        hsv : numpy.ndarray
+            HSV image.
+        target_color : str
+            Target color label.
+
+        Returns
+        -------
+        tuple or None
+            `(cx, cy, area, mask)` if found, otherwise `None`.
+        """
+        mask = self._build_color_mask(hsv, target_color)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        largest = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(largest))
+        if area < 300.0:
+            return None
+
+        m = cv2.moments(largest)
+        if abs(m["m00"]) < 1e-6:
+            return None
+        cx = int(m["m10"] / m["m00"])
+        cy = int(m["m01"] / m["m00"])
+        return cx, cy, area, mask
+
     def get_transforms(self, observation, cube_prompt):
         """
         Calculate the transformation matrix for a specific prompted cube relative to the robot base frame,
@@ -189,9 +249,20 @@ class CubePoseDetector:
             tag_size=CUBE_TAG_SIZE,
         )
 
-        # Filter by color in a local patch around each tag center.
+        # Detect target color as a whole region first.
+        color_blob = self._largest_color_centroid(hsv, target_color) if hsv is not None else None
+        color_centroid = None
+        if color_blob is not None:
+            cx, cy, area, _ = color_blob
+            color_centroid = (float(cx), float(cy))
+            print(f"Detected {target_color} region centroid at ({cx}, {cy}), area={area:.1f}px")
+        else:
+            print(f"No strong {target_color} region found; falling back to local patch scoring.")
+
+        # Match the chosen color region to the nearest tag center.
         matched_tag = None
-        best_score = -1.0
+        best_distance = float('inf')
+        best_score = -1.0  # used only in fallback path
         for tag in tags:
             if hsv is None:
                 continue
@@ -199,11 +270,19 @@ class CubePoseDetector:
             if v < 0 or v >= hsv.shape[0] or u < 0 or u >= hsv.shape[1]:
                 continue
 
-            score = self._color_ratio_in_patch(hsv, u, v, target_color, patch_radius=12)
-            # Require some confidence but keep it permissive for lighting variation.
-            if score > 0.08 and score > best_score:
-                best_score = score
-                matched_tag = tag
+            if color_centroid is not None:
+                du = float(u) - color_centroid[0]
+                dv = float(v) - color_centroid[1]
+                d2 = du * du + dv * dv
+                if d2 < best_distance:
+                    best_distance = d2
+                    matched_tag = tag
+            else:
+                # Fallback: local patch if full-blob segmentation fails.
+                score = self._color_ratio_in_patch(hsv, u, v, target_color, patch_radius=12)
+                if score > 0.06 and score > best_score:
+                    best_score = score
+                    matched_tag = tag
 
         if matched_tag is None:
             print(f"No AprilTag matched prompt '{cube_prompt}'.")
