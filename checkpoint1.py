@@ -26,6 +26,10 @@ def grasp_cube(arm, cube_pose):
         A 4x4 transformation matrix representing the cube's pose in the robot base frame.
         All translational units in this matrix are in meters.
     """
+    # commands for opening / closing / stopping parallel gripper (after completed movement)
+    # arm.open_lite6_gripper()
+    # arm.close_lite6_gripper()
+    # arm.stop_lite6_gripper()
     # TODO
     pass
 
