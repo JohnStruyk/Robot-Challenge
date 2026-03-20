@@ -102,8 +102,7 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     camera_intrinsic : numpy.ndarray
         The 3x3 intrinsic camera matrix.
     camera_pose : numpy.ndarray
-        A 4x4 transformation matrix returned by checkpoint0's solvePnP pipeline.
-        In that pipeline, this matrix maps robot/world frame points into the camera frame.
+        A 4x4 transformation matrix representing the camera's pose in the robot base frame (t_cam_robot).
         All translations are in meters.
 
     Returns
