@@ -69,8 +69,48 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
         are 4x4 transformation matrices with translations in meters. 
         If no cube tag is detected, returns None.
     """
-    # TODO
-    pass
+    if len(observation.shape) == 3:
+        gray = cv2.cvtColor(observation, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = observation
+
+    # --- 2. Camera parameters for apriltag ---
+    fx = camera_intrinsic[0, 0]
+    fy = camera_intrinsic[1, 1]
+    cx = camera_intrinsic[0, 2]
+    cy = camera_intrinsic[1, 2]
+
+    camera_params = (fx, fy, cx, cy)
+
+    tag_size = 0.05  # meters (adjust to your cube tag size)
+
+    # --- 3. Detect tags ---
+    detections = Detector.detect(
+        gray,
+        estimate_tag_pose=True,
+        camera_params=camera_params,
+        tag_size=tag_size
+    )
+
+    if len(detections) == 0:
+        return None
+
+    # --- 4. Use first detection (or filter by tag_id if needed) ---
+    det = detections[0]
+
+    R_cam_cube = det.pose_R   # (3,3)
+    t_cam_cube_vec = det.pose_t  # (3,1)
+
+    # --- 5. Build homogeneous transform (camera -> cube) ---
+    t_cam_cube = np.eye(4)
+    t_cam_cube[:3, :3] = R_cam_cube
+    t_cam_cube[:3, 3] = t_cam_cube_vec.flatten()
+
+    # --- 6. Convert to robot frame ---
+    # camera_pose = T_robot_cam
+    t_robot_cube = camera_pose @ t_cam_cube
+
+    return t_robot_cube, t_cam_cube
 
 def main():
 
