@@ -1,4 +1,5 @@
 import cv2, numpy, time
+import itertools
 from pupil_apriltags import Detector
 from xarm.wrapper import XArmAPI
 
@@ -160,9 +161,28 @@ class CubePoseDetector:
             uint8 mask with 255 at target-color pixels.
         """
         mask = numpy.zeros(hsv.shape[:2], dtype=numpy.uint8)
-        for low, high in self.color_ranges[target_color]:
-            partial = cv2.inRange(hsv, low, high)
-            mask = cv2.bitwise_or(mask, partial)
+        used_cuda = False
+        # Use CUDA path when available (NVIDIA GPU), fallback to CPU.
+        if hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            try:
+                gpu_hsv = cv2.cuda_GpuMat()
+                gpu_hsv.upload(hsv)
+                gpu_mask = None
+                for low, high in self.color_ranges[target_color]:
+                    low_b = tuple(int(x) for x in low.tolist())
+                    high_b = tuple(int(x) for x in high.tolist())
+                    partial = cv2.cuda.inRange(gpu_hsv, low_b, high_b)
+                    gpu_mask = partial if gpu_mask is None else cv2.cuda.bitwise_or(gpu_mask, partial)
+                if gpu_mask is not None:
+                    mask = gpu_mask.download()
+                    used_cuda = True
+            except Exception:
+                used_cuda = False
+
+        if not used_cuda:
+            for low, high in self.color_ranges[target_color]:
+                partial = cv2.inRange(hsv, low, high)
+                mask = cv2.bitwise_or(mask, partial)
 
         # Morphological cleanup: remove speckles and fill small holes.
         kernel = numpy.ones((5, 5), dtype=numpy.uint8)
@@ -237,6 +257,7 @@ class CubePoseDetector:
             hsv = None
 
         target_color = self._prompt_to_color(cube_prompt)
+        all_colors = ('red', 'green', 'blue')
         tags = self.detector.detect(
             gray,
             estimate_tag_pose=True,
@@ -249,40 +270,67 @@ class CubePoseDetector:
             tag_size=CUBE_TAG_SIZE,
         )
 
-        # Detect target color as a whole region first.
-        color_blob = self._largest_color_centroid(hsv, target_color) if hsv is not None else None
-        color_centroid = None
-        if color_blob is not None:
-            cx, cy, area, _ = color_blob
-            color_centroid = (float(cx), float(cy))
-            print(f"Detected {target_color} region centroid at ({cx}, {cy}), area={area:.1f}px")
-        else:
-            print(f"No strong {target_color} region found; falling back to local patch scoring.")
-
-        # Match the chosen color region to the nearest tag center.
+        # Robust association strategy:
+        # 1) Detect color centroids for all colors.
+        # 2) Assign visible color centroids to unique tags by minimum total distance.
+        # 3) If target color is not visible, infer it as the remaining unassigned tag.
         matched_tag = None
-        best_distance = float('inf')
-        best_score = -1.0  # used only in fallback path
-        for tag in tags:
-            if hsv is None:
-                continue
-            u, v = int(round(tag.center[0])), int(round(tag.center[1]))
-            if v < 0 or v >= hsv.shape[0] or u < 0 or u >= hsv.shape[1]:
-                continue
+        color_centroids = {}
+        if hsv is not None:
+            for c in all_colors:
+                blob = self._largest_color_centroid(hsv, c)
+                if blob is not None:
+                    cx, cy, area, _ = blob
+                    color_centroids[c] = (float(cx), float(cy), float(area))
+                    print(f"Detected {c} region centroid at ({cx}, {cy}), area={area:.1f}px")
 
-            if color_centroid is not None:
-                du = float(u) - color_centroid[0]
-                dv = float(v) - color_centroid[1]
-                d2 = du * du + dv * dv
-                if d2 < best_distance:
-                    best_distance = d2
-                    matched_tag = tag
-            else:
-                # Fallback: local patch if full-blob segmentation fails.
-                score = self._color_ratio_in_patch(hsv, u, v, target_color, patch_radius=12)
-                if score > 0.06 and score > best_score:
-                    best_score = score
-                    matched_tag = tag
+        tag_indices = list(range(len(tags)))
+        visible_colors = [c for c in all_colors if c in color_centroids]
+        assigned_color_to_tag = {}
+
+        if tags and visible_colors:
+            best_cost = float('inf')
+            best_assign = None
+            # Brute-force over permutations (tiny set: <= 3).
+            for perm in itertools.permutations(tag_indices, min(len(visible_colors), len(tag_indices))):
+                cost = 0.0
+                valid = True
+                for ci, color in enumerate(visible_colors[:len(perm)]):
+                    tx, ty = tags[perm[ci]].center
+                    cx, cy, _ = color_centroids[color]
+                    d2 = (float(tx) - cx) ** 2 + (float(ty) - cy) ** 2
+                    cost += d2
+                if valid and cost < best_cost:
+                    best_cost = cost
+                    best_assign = perm
+            if best_assign is not None:
+                for ci, color in enumerate(visible_colors[:len(best_assign)]):
+                    assigned_color_to_tag[color] = best_assign[ci]
+
+        # Primary path: target color directly assigned.
+        if target_color in assigned_color_to_tag:
+            matched_tag = tags[assigned_color_to_tag[target_color]]
+        else:
+            # Fallback 1: infer missing target as remaining tag when 3 tags are present.
+            if len(tags) >= 3 and len(assigned_color_to_tag) >= 2:
+                used = set(assigned_color_to_tag.values())
+                remaining = [idx for idx in tag_indices if idx not in used]
+                if remaining:
+                    matched_tag = tags[remaining[0]]
+                    print(f"Inferred {target_color} as remaining unassigned tag index={remaining[0]}.")
+            # Fallback 2: local patch score if inference not possible.
+            if matched_tag is None and hsv is not None:
+                best_score = -1.0
+                for tag in tags:
+                    u, v = int(round(tag.center[0])), int(round(tag.center[1]))
+                    if v < 0 or v >= hsv.shape[0] or u < 0 or u >= hsv.shape[1]:
+                        continue
+                    score = self._color_ratio_in_patch(hsv, u, v, target_color, patch_radius=14)
+                    if score > best_score:
+                        best_score = score
+                        matched_tag = tag
+                if best_score >= 0.0:
+                    print(f"Fallback patch score for {target_color}: {best_score:.3f}")
 
         if matched_tag is None:
             print(f"No AprilTag matched prompt '{cube_prompt}'.")
