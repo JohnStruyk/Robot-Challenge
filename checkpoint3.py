@@ -47,7 +47,7 @@ class CubePoseDetector:
                 (numpy.array([35, 80, 80]), numpy.array([85, 255, 255])),
             ],
             'blue': [
-                (numpy.array([90, 80, 80]), numpy.array([140, 255, 255])),
+                (numpy.array([85, 60, 40]), numpy.array([145, 255, 255])),
             ],
         }
 
@@ -104,6 +104,45 @@ class CubePoseDetector:
                 return True
         return False
 
+    def _color_ratio_in_patch(self, hsv, u, v, target_color, patch_radius=10):
+        """
+        Compute the fraction of pixels matching a target color in a local patch.
+
+        Parameters
+        ----------
+        hsv : numpy.ndarray
+            HSV image.
+        u : int
+            Patch center x pixel coordinate.
+        v : int
+            Patch center y pixel coordinate.
+        target_color : str
+            Target color label.
+        patch_radius : int, optional
+            Half-size of the square patch around (u, v).
+
+        Returns
+        -------
+        float
+            Ratio in [0, 1] of pixels classified as target color.
+        """
+        h, w = hsv.shape[:2]
+        u0, u1 = max(0, u - patch_radius), min(w, u + patch_radius + 1)
+        v0, v1 = max(0, v - patch_radius), min(h, v + patch_radius + 1)
+        patch = hsv[v0:v1, u0:u1]
+        if patch.size == 0:
+            return 0.0
+
+        mask = numpy.zeros(patch.shape[:2], dtype=bool)
+        for low, high in self.color_ranges[target_color]:
+            m = (
+                (patch[:, :, 0] >= low[0]) & (patch[:, :, 0] <= high[0]) &
+                (patch[:, :, 1] >= low[1]) & (patch[:, :, 1] <= high[1]) &
+                (patch[:, :, 2] >= low[2]) & (patch[:, :, 2] <= high[2])
+            )
+            mask |= m
+        return float(mask.mean())
+
     def get_transforms(self, observation, cube_prompt):
         """
         Calculate the transformation matrix for a specific prompted cube relative to the robot base frame,
@@ -128,7 +167,10 @@ class CubePoseDetector:
 
         if len(observation.shape) > 2:
             bgr = observation[:, :, :3]
-            gray = cv2.cvtColor(observation, cv2.COLOR_BGRA2GRAY)
+            if observation.shape[2] == 4:
+                gray = cv2.cvtColor(observation, cv2.COLOR_BGRA2GRAY)
+            else:
+                gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
             hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
         else:
             gray = observation
@@ -147,9 +189,9 @@ class CubePoseDetector:
             tag_size=CUBE_TAG_SIZE,
         )
 
-        # Filter by color at tag center pixel. Choose the closest matching tag.
+        # Filter by color in a local patch around each tag center.
         matched_tag = None
-        min_depth = float('inf')
+        best_score = -1.0
         for tag in tags:
             if hsv is None:
                 continue
@@ -157,11 +199,11 @@ class CubePoseDetector:
             if v < 0 or v >= hsv.shape[0] or u < 0 or u >= hsv.shape[1]:
                 continue
 
-            if self._is_color_match(hsv[v, u], target_color):
-                depth = float(tag.pose_t.flatten()[2])
-                if depth < min_depth:
-                    min_depth = depth
-                    matched_tag = tag
+            score = self._color_ratio_in_patch(hsv, u, v, target_color, patch_radius=12)
+            # Require some confidence but keep it permissive for lighting variation.
+            if score > 0.08 and score > best_score:
+                best_score = score
+                matched_tag = tag
 
         if matched_tag is None:
             print(f"No AprilTag matched prompt '{cube_prompt}'.")
@@ -211,7 +253,8 @@ def main():
         t_robot_cube, t_cam_cube = result
 
         # Visualization
-        draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube)
+        if t_cam_cube is not None and numpy.isfinite(t_cam_cube).all():
+            draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube)
         cv2.namedWindow('Verifying Cube Pose', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('Verifying Cube Pose', 1280, 720)
         cv2.imshow('Verifying Cube Pose', cv_image)
