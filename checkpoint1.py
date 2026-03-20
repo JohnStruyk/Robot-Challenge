@@ -12,7 +12,7 @@ CUBE_TAG_FAMILY = 'tag36h11'
 CUBE_TAG_ID = 4
 CUBE_TAG_SIZE = 0.02045
 
-robot_ip = '192.168..1.183'
+robot_ip = '192.168.1.183'
 
 # Motion constants (meters / degrees)
 SAFE_Z = 0.22
@@ -48,14 +48,14 @@ def grasp_cube(arm, cube_pose):
 
     # Ensure gripper is open before approach.
     arm.open_lite6_gripper()
-    arm.stop_lite6_gripper()
+    #arm.stop_lite6_gripper()
     time.sleep(0.2)
 
     # Approach -> descend -> grasp -> lift.
     arm.set_position(x_mm, y_mm, safe_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
     arm.set_position(x_mm, y_mm, grasp_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
     arm.close_lite6_gripper()
-    arm.stop_lite6_gripper()
+    #arm.stop_lite6_gripper()
     time.sleep(0.2)
     arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
 
@@ -196,6 +196,8 @@ def main():
             print(f'Cube in robot frame (m): x={xyz[0]:.3f}, y={xyz[1]:.3f}, z={xyz[2]:.3f}')
             grasp_cube(arm, t_robot_cube)
             place_cube(arm, t_robot_cube)
+
+            arm.stop_lite6_gripper()
     
     finally:
         # Close Lite6 Robot
