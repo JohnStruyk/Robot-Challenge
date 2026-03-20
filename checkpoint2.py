@@ -4,12 +4,28 @@ from xarm.wrapper import XArmAPI
 from utils.vis_utils import draw_pose_axes
 from utils.zed_camera import ZedCamera
 from checkpoint0 import get_transform_camera_robot
-from checkpoint1 import grasp_cube, get_transform_cube, GRIPPER_LENGTH, _initialize_gripper
+from checkpoint1 import get_transform_cube
+from checkpoint1 import grasp_cube
 
 # If measured with the xArm web UI, values are usually in millimeters/degrees.
 BASKET_POSE = [230.1, -305.5, 151.1, 178.4, -1.3, -32.8]  # Update using free-drive measurements.
 
+GRIPPER_LENGTH = 0.067 * 1000
+CUBE_TAG_FAMILY = 'tag36h11'
+CUBE_TAG_ID = 4
+CUBE_TAG_SIZE = 0.02045
+
 robot_ip = '192.168.1.183'
+
+# Motion constants (meters / degrees)
+SAFE_Z = 0.22
+GRASP_Z_OFFSET = 0.008
+LIFT_Z_DELTA = 0.06
+PLACE_Z_OFFSET = 0.012
+
+# Keep tool mostly vertical; only yaw is adapted from cube pose.
+TOOL_ROLL_DEG = 180.0
+TOOL_PITCH_DEG = 0.0
 
 def place_in_basket(arm, basket_pose, vaccum_gripper=False):
     """
@@ -70,7 +86,6 @@ def main():
     arm = XArmAPI(robot_ip)
     arm.connect()
     arm.motion_enable(enable=True)
-    _initialize_gripper(arm)
     arm.set_tcp_offset([0, 0, GRIPPER_LENGTH, 0, 0, 0])
     arm.set_mode(0)
     arm.set_state(0)
