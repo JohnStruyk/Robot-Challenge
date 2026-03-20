@@ -3,7 +3,7 @@ import pyzed.sl as sl
 
 class ZedCamera:
 
-    def __init__(self, resolution=sl.RESOLUTION.HD2K, fps=15, exposure=20):
+    def __init__(self, resolution=sl.RESOLUTION.HD2K, fps=15, exposure=15):
 
         # Initialize ZED Camera
         self._zed = sl.Camera()
@@ -26,7 +26,7 @@ class ZedCamera:
             self._zed.grab(sl.RuntimeParameters())
 
         # Setup Explosure for Better Image Quality
-        self._zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, exposure)
+        # self._zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, exposure)
 
         # Get Camera Intrinsic
         camera_info = self._zed.get_camera_information()

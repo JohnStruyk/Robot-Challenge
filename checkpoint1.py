@@ -16,9 +16,9 @@ robot_ip = '192.168.1.183'
 
 # Motion constants (meters / degrees)
 SAFE_Z = 0.22
-GRASP_Z_OFFSET = 0.008
+GRASP_Z_OFFSET = 0.0001
 LIFT_Z_DELTA = 0.06
-PLACE_Z_OFFSET = 0.012
+PLACE_Z_OFFSET = 0.002
 
 # Keep tool mostly vertical; only yaw is adapted from cube pose.
 TOOL_ROLL_DEG = 180.0
@@ -49,14 +49,14 @@ def grasp_cube(arm, cube_pose):
     # Ensure gripper is open before approach.
     arm.open_lite6_gripper()
     #arm.stop_lite6_gripper()
-    time.sleep(0.2)
+    time.sleep(1)
 
     # Approach -> descend -> grasp -> lift.
     arm.set_position(x_mm, y_mm, safe_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
     arm.set_position(x_mm, y_mm, grasp_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
     arm.close_lite6_gripper()
     #arm.stop_lite6_gripper()
-    time.sleep(0.2)
+    time.sleep(1)
     arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
 
 def place_cube(arm, cube_pose):
@@ -83,8 +83,8 @@ def place_cube(arm, cube_pose):
     arm.set_position(x_mm, y_mm, safe_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
     arm.set_position(x_mm, y_mm, place_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
     arm.open_lite6_gripper()
-    arm.stop_lite6_gripper()
-    time.sleep(0.2)
+    #arm.stop_lite6_gripper()
+    time.sleep(1)
     arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
 
 def get_transform_cube(observation, camera_intrinsic, camera_pose):
@@ -200,6 +200,7 @@ def main():
     
     finally:
         # Close Lite6 Robot
+        arm.stop_lite6_gripper()
         arm.move_gohome(wait=True)
         time.sleep(0.5)
         arm.disconnect()

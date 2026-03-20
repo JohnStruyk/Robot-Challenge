@@ -397,6 +397,8 @@ def main():
             
     finally:
         # Close Lite6 Robot
+        arm.stop_lite6_gripper()
+        time.sleep(0.5)
         arm.move_gohome(wait=True)
         time.sleep(0.5)
         arm.disconnect()
