@@ -4,12 +4,28 @@ from xarm.wrapper import XArmAPI
 from utils.vis_utils import draw_pose_axes
 from utils.zed_camera import ZedCamera
 from checkpoint0 import get_transform_camera_robot
-from checkpoint1 import grasp_cube, get_transform_cube, GRIPPER_LENGTH
+from checkpoint1 import get_transform_cube
+from checkpoint1 import grasp_cube
 
-# TODO
-BASKET_POSE = None # Measure it using the robot's free drive mode.
+# If measured with the xArm web UI, values are usually in millimeters/degrees.
+BASKET_POSE = [230.1, -305.5, 151.1, 178.4, -1.3, -32.8]  # Update using free-drive measurements.
 
-robot_ip = ''
+GRIPPER_LENGTH = 0.067 * 1000
+CUBE_TAG_FAMILY = 'tag36h11'
+CUBE_TAG_ID = 4
+CUBE_TAG_SIZE = 0.02045
+
+robot_ip = '192.168.1.183'
+
+# Motion constants (meters / degrees)
+SAFE_Z = 0.22
+GRASP_Z_OFFSET = 0.008
+LIFT_Z_DELTA = 0.06
+PLACE_Z_OFFSET = 0.012
+
+# Keep tool mostly vertical; only yaw is adapted from cube pose.
+TOOL_ROLL_DEG = 180.0
+TOOL_PITCH_DEG = 0.0
 
 def place_in_basket(arm, basket_pose, vaccum_gripper=False):
     """
@@ -28,8 +44,37 @@ def place_in_basket(arm, basket_pose, vaccum_gripper=False):
         If True, uses the vacuum gripper logic instead of the standard Lite6 
         gripper. Defaults to False.
     """
-    # TODO
-    pass
+    if basket_pose is None:
+        raise ValueError('BASKET_POSE is not set.')
+    if len(basket_pose) not in (3, 6):
+        raise ValueError('basket_pose must have 3 or 6 elements.')
+
+    if len(basket_pose) == 3:
+        x_mm, y_mm, z_mm = [float(v) for v in basket_pose]
+        roll_deg, pitch_deg, yaw_deg = 180.0, 0.0, 90.0
+    else:
+        x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg = [float(v) for v in basket_pose]
+
+    safe_z_mm = max(220.0, z_mm + 80.0)
+
+    arm.set_position(x_mm, y_mm, safe_z_mm, roll_deg, pitch_deg, yaw_deg, is_radian=False, wait=True)
+    arm.set_position(x_mm, y_mm, z_mm, roll_deg, pitch_deg, yaw_deg, is_radian=False, wait=True)
+
+    # This checkpoint is configured for the parallel gripper (not vacuum).
+    if vaccum_gripper:
+        raise ValueError('vaccum_gripper must be False for this setup (parallel gripper only).')
+
+    if hasattr(arm, 'open_lite6_gripper'):
+        arm.open_lite6_gripper()
+        time.sleep(0.6)
+        if hasattr(arm, 'stop_lite6_gripper'):
+            arm.stop_lite6_gripper()
+    elif hasattr(arm, 'set_gripper_position'):
+        arm.set_gripper_position(850, wait=True)
+    else:
+        raise RuntimeError('No supported parallel-gripper release method found.')
+
+    arm.set_position(x_mm, y_mm, safe_z_mm, roll_deg, pitch_deg, yaw_deg, is_radian=False, wait=True)
 
 def main():
 
@@ -52,7 +97,14 @@ def main():
         cv_image = zed.image
 
         t_cam_cube = None
-        #TODO
+        t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
+        if t_cam_robot is None:
+            return
+
+        cube_result = get_transform_cube(cv_image, camera_intrinsic, t_cam_robot)
+        if cube_result is None:
+            return
+        t_robot_cube, t_cam_cube = cube_result
         
         # Visualization
         draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube)
@@ -64,7 +116,10 @@ def main():
         if key == ord('k'):
             cv2.destroyAllWindows()
 
-            # TODO
+            xyz = t_robot_cube[:3, 3]
+            print(f'Cube in robot frame (m): x={xyz[0]:.3f}, y={xyz[1]:.3f}, z={xyz[2]:.3f}')
+            grasp_cube(arm, t_robot_cube)
+            place_in_basket(arm, BASKET_POSE, vaccum_gripper=False)
     
     finally:
         # Close Lite6 Robot
