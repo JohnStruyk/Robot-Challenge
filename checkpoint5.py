@@ -1,52 +1,4 @@
-from checkpoint3 import CubePoseDetector
-
-import cv2, time
-from xarm.wrapper import XArmAPI
-
-from utils.vis_utils import draw_pose_axes
-from utils.zed_camera import ZedCamera
-from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH
-from checkpoint4 import STACK_HEIGHT
-
-stacking_order = ['red cube', 'green cube', 'blue cube']   # From top to bottom
-robot_ip = ''
-
-def main():
-
-    # Initialize ZED Camera
-    zed = ZedCamera()
-    camera_intrinsic = zed.camera_intrinsic
-
-    # Initialize Cube Pose Detector
-    cube_pose_detector = CubePoseDetector(camera_intrinsic)
-
-    # Initialize Lite6 Robot
-    arm = XArmAPI(robot_ip)
-    arm.connect()
-    arm.motion_enable(enable=True)
-    arm.set_tcp_offset([0, 0, GRIPPER_LENGTH, 0, 0, 0])
-    arm.set_mode(0)
-    arm.set_state(0)
-    arm.move_gohome(wait=True)
-    time.sleep(0.5)
-
-    try:
-        # Get Observation
-        cv_image = zed.image
-
-        # TODO
-    
-    finally:
-        # Close Lite6 Robot
-        arm.move_gohome(wait=True)
-        time.sleep(0.5)
-        arm.disconnect()
-
-        # Close ZED Camera
-        zed.close()
-
-if __name__ == "__main__":
-    main()import cv2
+import cv2
 import time
 import numpy as np
 from xarm.wrapper import XArmAPI
@@ -58,7 +10,7 @@ from utils.zed_camera import ZedCamera
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 from checkpoint4 import STACK_HEIGHT
 
-# Defined as Top -> Middle -> Bottom based on the target state image
+# Defined as Top, Middle, Bottom
 stacking_order = ['red cube', 'green cube', 'blue cube']
 
 def main():
@@ -80,10 +32,10 @@ def main():
     time.sleep(0.5)
 
     try:
-        # 1. Get initial observation
+        # Get initial observation
         cv_image = zed.image
 
-        # 2. Establish Camera-to-Robot Transform
+        # Establish Camera-to-Robot Transform
         t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
         if t_cam_robot is None:
             print("Failed to find Camera-to-Robot transform.")
@@ -91,8 +43,8 @@ def main():
         
         cube_pose_detector.set_camera_pose(t_cam_robot)
 
-        # 3. Locate all cubes before moving
-        # We store them in a dictionary for easy access
+        # Locate all cubes before moving
+        # store them in a dictionary
         cube_poses_robot = {}
         cube_poses_cam = {}
         
@@ -118,7 +70,7 @@ def main():
             cv2.destroyAllWindows()
 
             # --- STEP 1: STACK GREEN ON BLUE ---
-            # Blue is the base (doesn't move). 
+            # Blue is the bottom 
             # Target for Green is Blue's XY + (1 * STACK_HEIGHT)
             print("Moving GREEN to BLUE...")
             grasp_cube(arm, cube_poses_robot['green cube'])
@@ -129,7 +81,6 @@ def main():
 
             # --- STEP 2: STACK RED ON GREEN ---
             # Target for Red is Blue's XY + (2 * STACK_HEIGHT)
-            # Using Blue as the anchor prevents cumulative error
             print("Moving RED to GREEN...")
             grasp_cube(arm, cube_poses_robot['red cube'])
             
