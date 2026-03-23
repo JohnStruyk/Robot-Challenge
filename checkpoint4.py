@@ -78,7 +78,7 @@ def main():
             print("Picking up RED cube...")
             grasp_cube(arm, t_robot_red)
 
-            # --- PREPARE STACK POSE ---
+            # --- DETERMINE STACK POSE ---
             # We take the green cube's location and add our STACK_HEIGHT to the Z axis
             t_robot_stack = np.copy(t_robot_green)
             t_robot_stack[2, 3] += STACK_HEIGHT
