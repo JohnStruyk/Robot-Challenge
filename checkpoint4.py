@@ -9,8 +9,7 @@ from utils.vis_utils import draw_pose_axes
 from utils.zed_camera import ZedCamera
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 
-# TODO: Determine a suitable height yourself
-# The cube is 0.025m. We need to clear the green cube then drop.
+# TODO: Determine cube height
 CUBE_SIZE = 0.020
 STACK_HEIGHT = CUBE_SIZE # + 0.005
 
@@ -52,7 +51,7 @@ def main():
         # Locate the RED cube 
         res_red = cube_pose_detector.get_transforms(cv_image, "red cube")
         
-        # Locate the GREEN cube (The one we stack on)
+        # Locate the GREEN cube
         res_green = cube_pose_detector.get_transforms(cv_image, "green cube")
 
         if res_red is None or res_green is None:
@@ -84,7 +83,7 @@ def main():
             t_robot_stack = np.copy(t_robot_green)
             t_robot_stack[2, 3] += STACK_HEIGHT
 
-            # --- PLACE ON GREEN ---
+            # --- PLACE ON STACK POSE ---
             print("Stacking on GREEN cube...")
             place_cube(arm, t_robot_stack)
 
