@@ -1,3 +1,4 @@
+
 import cv2, numpy, time
 import itertools
 from pupil_apriltags import Detector
@@ -189,6 +190,51 @@ class CubePoseDetector:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         return mask
+    
+    def visualize_detections(self, hsv, bgr, tags):
+        """
+        Debug helper to show what the detector 'sees' for every visible tag.
+        """
+        debug_img = bgr.copy()
+        print(f"\n--- Debug: Analyzing {len(tags)} detected tags ---")
+        
+        for i, tag in enumerate(tags):
+            u, v = int(round(tag.center[0])), int(round(tag.center[1]))
+            patch_radius = 15
+            
+            # Extract crop for display
+            h, w = hsv.shape[:2]
+            u0, u1 = max(0, u - patch_radius), min(w, u + patch_radius + 1)
+            v0, v1 = max(0, v - patch_radius), min(h, v + patch_radius + 1)
+            patch_bgr = bgr[v0:v1, u0:u1]
+
+            # Calculate scores for all colors
+            scores = {c: self._color_ratio_in_patch(hsv, u, v, c, patch_radius) for c in self.color_ranges}
+            best_color = max(scores, key=scores.get)
+            max_score = scores[best_color]
+
+            # Logic for debug label
+            if max_score < 0.15:
+                label = f"ID:{tag.tag_id} NEUTRAL (Score:{max_score:.2f})"
+                color_bgr = (128, 128, 128)
+            else:
+                label = f"ID:{tag.tag_id} {best_color.upper()} ({max_score:.2f})"
+                color_map = {'red': (0, 0, 255), 'green': (0, 255, 0), 'blue': (255, 0, 0)}
+                color_bgr = color_map.get(best_color, (255, 255, 255))
+
+            # Draw on main image
+            cv2.rectangle(debug_img, (u0, v0), (u1, v1), color_bgr, 2)
+            cv2.putText(debug_img, label, (u0, v0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 2)
+            
+            # Show zoomed patch
+            if patch_bgr.size > 0:
+                patch_zoom = cv2.resize(patch_bgr, (150, 150), interpolation=cv2.INTER_NEAREST)
+                cv2.imshow(f"Tag {tag.tag_id} Patch", patch_zoom)
+
+        cv2.imshow("Debug: Color Association", debug_img)
+        print("Check the pop-up windows. Press any key to proceed...")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
     def _largest_color_centroid(self, hsv, target_color):
         """
@@ -270,6 +316,9 @@ class CubePoseDetector:
             tag_size=CUBE_TAG_SIZE,
         )
 
+        # Trigger Visualizer
+        self.visualize_detections(hsv, bgr, tags)
+
         # Robust association strategy:
         # 1) Detect color centroids for all colors.
         # 2) Assign visible color centroids to unique tags by minimum total distance.
@@ -309,10 +358,10 @@ class CubePoseDetector:
 
         # Primary path: target color directly assigned.
         if 1 < 0 and target_color in assigned_color_to_tag:
+            print("PRIMARY PATH")
             matched_tag = tags[assigned_color_to_tag[target_color]]
-            print("FOLOOWING PRIMARY PATH")
         else:
-            print("FOLOOWING SECONDARY PATH")
+            print("SECONDARY PATH")
             # Fallback 1: infer missing target as remaining tag when 3 tags are present.
             if 1 < 0 and len(tags) >= 3 and len(assigned_color_to_tag) >= 2:
                 used = set(assigned_color_to_tag.values())
@@ -327,9 +376,7 @@ class CubePoseDetector:
                     u, v = int(round(tag.center[0])), int(round(tag.center[1]))
                     if v < 0 or v >= hsv.shape[0] or u < 0 or u >= hsv.shape[1]:
                         continue
-                    print("collecting score")
-                    score = self._color_ratio_in_patch(hsv, u, v, target_color, patch_radius=14)
-                    print(score)
+                    score = self._color_ratio_in_patch(hsv, u, v, target_color, patch_radius=44)
                     if score > best_score:
                         best_score = score
                         matched_tag = tag
