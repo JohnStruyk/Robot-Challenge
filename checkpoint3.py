@@ -357,11 +357,13 @@ class CubePoseDetector:
                     assigned_color_to_tag[color] = best_assign[ci]
 
         # Primary path: target color directly assigned.
-        if target_color in assigned_color_to_tag:
+        if 1 < 0 and target_color in assigned_color_to_tag:
+            print("PRIMARY PATH")
             matched_tag = tags[assigned_color_to_tag[target_color]]
         else:
+            print("SECONDARY PATH")
             # Fallback 1: infer missing target as remaining tag when 3 tags are present.
-            if len(tags) >= 3 and len(assigned_color_to_tag) >= 2:
+            if 1 < 0 and len(tags) >= 3 and len(assigned_color_to_tag) >= 2:
                 used = set(assigned_color_to_tag.values())
                 remaining = [idx for idx in tag_indices if idx not in used]
                 if remaining:
@@ -374,7 +376,7 @@ class CubePoseDetector:
                     u, v = int(round(tag.center[0])), int(round(tag.center[1]))
                     if v < 0 or v >= hsv.shape[0] or u < 0 or u >= hsv.shape[1]:
                         continue
-                    score = self._color_ratio_in_patch(hsv, u, v, target_color, patch_radius=14)
+                    score = self._color_ratio_in_patch(hsv, u, v, target_color, patch_radius=44)
                     if score > best_score:
                         best_score = score
                         matched_tag = tag
