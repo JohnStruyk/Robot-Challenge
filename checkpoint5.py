@@ -96,9 +96,13 @@ def main():
     finally:
         # Safety: always bring the arm home and disconnect
         print("Cleaning up...")
+        arm.stop_lite6_gripper()
+        time.sleep(0.5)
         arm.move_gohome(wait=True)
         time.sleep(0.5)
         arm.disconnect()
+
+        # Close ZED Camera
         zed.close()
 
 if __name__ == "__main__":

@@ -317,7 +317,7 @@ class CubePoseDetector:
         )
 
         # Trigger Visualizer
-        self.visualize_detections(hsv, bgr, tags)
+        #self.visualize_detections(hsv, bgr, tags)
 
         # Robust association strategy:
         # 1) Detect color centroids for all colors.
