@@ -15,7 +15,7 @@ from checkpoint1 import (
     robot_ip,
 )
 
-cube_prompt = 'blue cube'
+cube_prompt = 'red cube'
 
 class CubePoseDetector:
     """
