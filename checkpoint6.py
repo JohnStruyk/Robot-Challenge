@@ -139,7 +139,7 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
 
 
 def draw_status_overlay(image_bgra, lines, color=(0, 220, 0)):
-    """Draw multiline status on BGRA image (mutates copy)."""
+    """Draw multiline status on BGRA image (copy)."""
     out = image_bgra.copy()
     y = 36
     for line in lines:
@@ -157,66 +157,97 @@ def draw_status_overlay(image_bgra, lines, color=(0, 220, 0)):
     return out
 
 
-def main():
-    zed = None
-    arm = None
+def run_pure_vision_perception(cv_image, point_cloud, camera_intrinsic):
+    """
+    Full pure-vision path: calibration + get_transform_cube + overlay for display.
+
+    Used by checkpoint 6 and checkpoint 7.
+
+    Parameters
+    ----------
+    cv_image : numpy.ndarray or None
+        BGRA frame from ZED.
+    point_cloud : numpy.ndarray or None
+        Dense XYZ point cloud aligned with the image.
+    camera_intrinsic : numpy.ndarray
+        3x3 intrinsics.
+
+    Returns
+    -------
+    tuple
+        ``(t_robot_cube, t_cam_cube, display_bgra, status_message)``
+        ``t_robot_cube`` / ``t_cam_cube`` may be ``None`` if perception fails.
+    """
+    if cv_image is None:
+        blank = numpy.zeros((720, 1280, 4), dtype=numpy.uint8)
+        disp = draw_status_overlay(blank, ["ZED image is None"], (0, 0, 255))
+        return None, None, disp, "no image"
+
+    t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
+    if t_cam_robot is None:
+        disp = draw_status_overlay(
+            cv_image,
+            ["Calibration FAILED (checkpoint0 tags / PnP)"],
+            (0, 0, 255),
+        )
+        return None, None, disp, "calibration failed"
+
     try:
-        zed = ZedCamera()
-        camera_intrinsic = zed.camera_intrinsic
+        result = get_transform_cube(
+            (cv_image, point_cloud), camera_intrinsic, t_cam_robot
+        )
+        if result is None or result[0] is None:
+            msg = result[1] if isinstance(result, tuple) and len(result) > 1 else "unknown"
+            disp = draw_status_overlay(
+                cv_image,
+                [f"Cube pose: {msg}"],
+                (0, 165, 255),
+            )
+            return None, None, disp, msg
 
-        arm = XArmAPI(robot_ip)
-        arm.connect()
-        arm.motion_enable(enable=True)
-        arm.set_tcp_offset([0, 0, GRIPPER_LENGTH, 0, 0, 0])
-        arm.set_mode(0)
-        arm.set_state(0)
-        arm.move_gohome(wait=True)
-        time.sleep(0.5)
+        (t_robot_cube, t_cam_cube), seg_msg = result
+        lines = [
+            f"Segmentation: {seg_msg}",
+            "OK - press k to run motion, any other key to quit",
+        ]
+        disp = cv_image.copy()
+        if t_cam_cube is not None and numpy.isfinite(t_cam_cube).all():
+            draw_pose_axes(disp, camera_intrinsic, t_cam_cube)
+        disp = draw_status_overlay(disp, lines, (0, 220, 0))
+        return t_robot_cube, t_cam_cube, disp, seg_msg
+    except Exception as exc:
+        traceback.print_exc()
+        disp = draw_status_overlay(
+            cv_image,
+            [f"Exception: {exc!s}"],
+            (0, 0, 255),
+        )
+        return None, None, disp, str(exc)
 
+
+def main():
+    zed = ZedCamera()
+    camera_intrinsic = zed.camera_intrinsic
+
+    arm = XArmAPI(robot_ip)
+    arm.connect()
+    arm.motion_enable(enable=True)
+    arm.set_tcp_offset([0, 0, GRIPPER_LENGTH, 0, 0, 0])
+    arm.set_mode(0)
+    arm.set_state(0)
+    arm.move_gohome(wait=True)
+    time.sleep(0.5)
+
+    try:
         cv_image = zed.image
         point_cloud = zed.point_cloud
-        if cv_image is None:
-            blank = numpy.zeros((720, 1280, 4), dtype=numpy.uint8)
-            cv2.putText(blank, "ZED image is None", (40, 360), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
-            cv2.namedWindow("Checkpoint 6", cv2.WINDOW_NORMAL)
-            cv2.imshow("Checkpoint 6", blank)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
-            return
+        t_robot_cube, _t_cam_cube, disp, _status = run_pure_vision_perception(
+            cv_image, point_cloud, camera_intrinsic
+        )
 
-        lines = []
-        t_cam_cube = None
-        t_robot_cube = None
-
-        t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
-        if t_cam_robot is None:
-            lines.append("Calibration FAILED (checkpoint0 tags / PnP)")
-            disp = draw_status_overlay(cv_image, lines, (0, 0, 255))
-        else:
-            try:
-                result = get_transform_cube((cv_image, point_cloud), camera_intrinsic, t_cam_robot)
-                if result is None or (isinstance(result, tuple) and result[0] is None):
-                    if isinstance(result, tuple) and len(result) >= 2:
-                        lines.append(f"Cube pose: {result[1]}")
-                    else:
-                        lines.append("Cube pose: unknown failure")
-                    disp = draw_status_overlay(cv_image, lines, (0, 165, 255))
-                else:
-                    (t_robot_cube, t_cam_cube), seg_msg = result
-                    lines.append(f"Segmentation: {seg_msg}")
-                    lines.append("OK - press k to run grasp/place, any other key to quit")
-                    disp = cv_image.copy()
-                    if t_cam_cube is not None and numpy.isfinite(t_cam_cube).all():
-                        draw_pose_axes(disp, camera_intrinsic, t_cam_cube)
-                    disp = draw_status_overlay(disp, lines, (0, 220, 0))
-            except Exception as exc:
-                traceback.print_exc()
-                lines.append(f"Exception: {exc!s}")
-                disp = draw_status_overlay(cv_image, lines, (0, 0, 255))
-
-        cv2.namedWindow("Checkpoint 6", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Checkpoint 6", 1280, 720)
-        cv2.imshow("Checkpoint 6", disp)
+        cv2.namedWindow("Verifying Cube Pose", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Verifying Cube Pose", 1280, 720)
+        cv2.imshow("Verifying Cube Pose", disp)
         key = cv2.waitKey(0)
 
         if key == ord("k") and t_robot_cube is not None:
@@ -231,44 +262,13 @@ def main():
         else:
             cv2.destroyAllWindows()
 
-    except Exception:
-        traceback.print_exc()
-        try:
-            if zed is not None and zed.image is not None:
-                err_img = draw_status_overlay(
-                    zed.image,
-                    ["Fatal error - see console"],
-                    (0, 0, 255),
-                )
-                cv2.namedWindow("Checkpoint 6", cv2.WINDOW_NORMAL)
-                cv2.imshow("Checkpoint 6", err_img)
-                cv2.waitKey(0)
-        except Exception:
-            pass
     finally:
-        if arm is not None:
-            try:
-                arm.stop_lite6_gripper()
-            except Exception:
-                pass
-            try:
-                arm.move_gohome(wait=True)
-            except Exception:
-                pass
-            time.sleep(0.5)
-            try:
-                arm.disconnect()
-            except Exception:
-                pass
-        if zed is not None:
-            try:
-                zed.close()
-            except Exception:
-                pass
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
+        arm.stop_lite6_gripper()
+        arm.move_gohome(wait=True)
+        time.sleep(0.5)
+        arm.disconnect()
+        zed.close()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
