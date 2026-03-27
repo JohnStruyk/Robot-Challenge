@@ -22,10 +22,12 @@ PLAY_MAT_Z_ROBOT_M = (-0.12, 0.48)
 # Drop top of frame (ceiling / back wall); keep lower area where the mat usually is.
 PLAY_MAT_IMAGE_TOP_CROP_FRAC = 0.12
 
-# Blue only: arm/gripper often fills wide HSV blue; exclude bottom of frame + prefer cube-sized blobs.
-ROBOT_ARM_EXCLUDE_BOTTOM_FRAC_BLUE = 0.34
-BLUE_CC_MIN_AREA_PX = 100
-BLUE_CC_MAX_AREA_FRAC = 0.14
+# Blue: restrict to central play-mat region (ellipse) + pick blob by cube shape & center score.
+BLUE_MAT_ELLIPSE_CY_FRAC = 0.40
+BLUE_MAT_ELLIPSE_AX_FRAC = 0.34
+BLUE_MAT_ELLIPSE_AY_FRAC = 0.30
+BLUE_BLOB_MIN_AREA_PX = 70
+BLUE_BLOB_MAX_AREA_FRAC = 0.18
 
 
 def scale_xyz_to_meters_frame(xyz):
@@ -81,60 +83,93 @@ def image_arena_roi_mask(shape_hw):
     return numpy.broadcast_to(keep, (h, shape_hw[1]))
 
 
-def image_exclude_bottom_frac_mask(shape_hw, frac):
-    """Boolean mask: False in the bottom ``frac`` of rows (robot arm / base strip)."""
-    h, w = shape_hw[0], shape_hw[1]
-    row = numpy.arange(h, dtype=numpy.int32)[:, None]
-    keep = row < int((1.0 - frac) * h)
-    return numpy.broadcast_to(keep, (h, w))
+def image_blue_play_mat_ellipse_mask(h, w):
+    """
+    Filled ellipse around the **center** of the frame (typical mat / cube area).
+    Excludes most of the robot arm (bottom/sides) and upper background.
+    """
+    m = numpy.zeros((h, w), dtype=numpy.uint8)
+    cx = int(0.5 * w)
+    cy = int(BLUE_MAT_ELLIPSE_CY_FRAC * h)
+    ax = max(1, int(BLUE_MAT_ELLIPSE_AX_FRAC * w))
+    ay = max(1, int(BLUE_MAT_ELLIPSE_AY_FRAC * h))
+    cv2.ellipse(m, (cx, cy), (ax, ay), 0, 0, 360, 255, thickness=-1)
+    return m
 
 
-def blue_bgr_dominance_mask(bgr_uint8):
-    """
-    Keep pixels where blue channel leads red/green (cube plastic), weakening gray metal arm.
-    """
-    b = bgr_uint8[:, :, 0].astype(numpy.int32)
-    g = bgr_uint8[:, :, 1].astype(numpy.int32)
-    r = bgr_uint8[:, :, 2].astype(numpy.int32)
-    return ((2 * b >= r + g - 8) & (b >= r - 3) & (b >= g - 3)).astype(numpy.uint8) * 255
+def blue_any_shade_luminance_floor(bgr_uint8):
+    """Drop near-black sensor noise; do not require B>R (any blue shade including dark)."""
+    s = numpy.sum(bgr_uint8.astype(numpy.int32), axis=2)
+    return (s > 22).astype(numpy.uint8) * 255
 
 
-def _cube_sized_connected_component(mask_uint8, h, w):
+def _select_blue_cube_blob(mask_uint8, h, w):
     """
-    Prefer a blob whose area matches a tabletop cube; skip arm-sized huge components.
-    If the largest blob is too big, use the next best under the cap.
+    Pick the blob that looks like a **cube on the mat**: near center of frame, square-ish
+    bbox, reasonable size. Deprioritizes elongated arm segments and huge arm clusters.
     """
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(
         mask_uint8, connectivity=8
     )
     if num <= 1:
         return mask_uint8
+
     img_area = float(h * w)
-    max_px = max(BLUE_CC_MIN_AREA_PX + 1, int(BLUE_CC_MAX_AREA_FRAC * img_area))
-    min_px = BLUE_CC_MIN_AREA_PX
+    max_px = max(BLUE_BLOB_MIN_AREA_PX + 1, int(BLUE_BLOB_MAX_AREA_FRAC * img_area))
+    min_px = BLUE_BLOB_MIN_AREA_PX
+    # Expected mat / cube center in image (slightly above geometric center).
+    cx0, cy0 = 0.5 * w, BLUE_MAT_ELLIPSE_CY_FRAC * h
 
     best_id = None
-    best_area = 0
+    best_score = -1.0
+
     for i in range(1, num):
         a = stats[i, cv2.CC_STAT_AREA]
-        if a < min_px or a > max_px:
+        if a < 40:
             continue
-        if a > best_area:
-            best_area = a
+        bw = stats[i, cv2.CC_STAT_WIDTH]
+        bh = stats[i, cv2.CC_STAT_HEIGHT]
+        if bw < 3 or bh < 3:
+            continue
+        cx, cy = float(centroids[i][0]), float(centroids[i][1])
+        aspect = min(bw, bh) / float(max(bw, bh))
+        bbox_area = float(bw * bh)
+        extent = a / bbox_area if bbox_area > 0 else 0.0
+        # Gaussian preference for blobs near mat center (cube), not arm at edges.
+        dx = (cx - cx0) / (0.42 * w + 1e-6)
+        dy = (cy - cy0) / (0.36 * h + 1e-6)
+        center_w = numpy.exp(-(dx * dx + dy * dy) * 1.85)
+        # Cube face: aspect ~1, high fill in bbox. Arm: low aspect, or huge area.
+        shape_w = (aspect ** 1.35) * (extent ** 0.9)
+        size_w = 1.0 if min_px <= a <= max_px else (0.12 if a > max_px else 0.35)
+        score = float(a) * shape_w * center_w * size_w
+
+        if score > best_score:
+            best_score = score
             best_id = i
 
     if best_id is not None:
         return numpy.where(labels == best_id, 255, 0).astype(numpy.uint8)
 
-    areas = [(i, stats[i, cv2.CC_STAT_AREA]) for i in range(1, num)]
-    areas.sort(key=lambda x: -x[1])
-    if (
-        len(areas) >= 2
-        and areas[0][1] > max_px
-        and min_px <= areas[1][1] <= max_px
-    ):
-        i = areas[1][0]
-        return numpy.where(labels == i, 255, 0).astype(numpy.uint8)
+    # Fallback: best center-weighted small/medium blob
+    best_id = None
+    best_score = -1.0
+    for i in range(1, num):
+        a = stats[i, cv2.CC_STAT_AREA]
+        if a < 40:
+            continue
+        cx, cy = float(centroids[i][0]), float(centroids[i][1])
+        dx = (cx - cx0) / (0.45 * w + 1e-6)
+        dy = (cy - cy0) / (0.40 * h + 1e-6)
+        sc = float(a) * numpy.exp(-(dx * dx + dy * dy) * 2.0)
+        if a > max_px:
+            sc *= 0.08
+        if sc > best_score:
+            best_score = sc
+            best_id = i
+
+    if best_id is not None:
+        return numpy.where(labels == best_id, 255, 0).astype(numpy.uint8)
 
     return _largest_connected_component(mask_uint8)
 
@@ -189,14 +224,14 @@ def _hsv_ranges_for_color(color_name, relaxed=False):
         ]
 
     if color_name == "blue":
-        # Wide blue band: cyan→blue→blue-violet; low S/V floors for navy / matte / dim lighting.
-        # OpenCV H in [0,179]: ~60–100 cyan/teal, ~100–130 blue, ~130–170 purple-magenta.
+        # Any cyan→blue→violet (OpenCV H); start ~76 to avoid picking pure green (≈35–75).
+        # Very permissive S/V for dark navy, pastel, or lit plastic.
         if relaxed:
-            lo_s, lo_v = 10, 5
-            h_lo, h_hi = 55, 175
+            lo_s, lo_v = 5, 4
+            h_lo, h_hi = 72, 179
         else:
-            lo_s, lo_v = 18, 10
-            h_lo, h_hi = 62, 168
+            lo_s, lo_v = 8, 6
+            h_lo, h_hi = 76, 179
         hi_s, hi_v = 255, 255
         return [((h_lo, lo_s, lo_v), (h_hi, hi_s, hi_v))]
 
@@ -212,8 +247,8 @@ def color_mask_bgr(image_bgra, color_name, relaxed=False):
     Binary mask for cube color: blur -> HSV -> union of ranges -> open/close ->
     connected component(s) -> light dilate.
 
-    For **blue**, drops the bottom image strip (arm/base), ANDs a BGR blue-dominance mask,
-    then keeps a **cube-sized** blob instead of the largest (often the arm).
+    For **blue**, restricts to a **central play-mat ellipse**, very wide HSV, mild luminance
+    floor, then selects the blob best matching a **cube** near the mat center (not the arm).
     """
     bgr = image_bgra[:, :, :3]
     bgr = cv2.GaussianBlur(bgr, (5, 5), 0)
@@ -228,10 +263,10 @@ def color_mask_bgr(image_bgra, color_name, relaxed=False):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5, iterations=2)
 
     if color_name == "blue":
-        keep_bottom = image_exclude_bottom_frac_mask((h, w), ROBOT_ARM_EXCLUDE_BOTTOM_FRAC_BLUE)
-        mask = cv2.bitwise_and(mask, (keep_bottom.astype(numpy.uint8) * 255))
-        mask = cv2.bitwise_and(mask, blue_bgr_dominance_mask(bgr))
-        mask = _cube_sized_connected_component(mask, h, w)
+        mat_ellipse = image_blue_play_mat_ellipse_mask(h, w)
+        mask = cv2.bitwise_and(mask, mat_ellipse)
+        mask = cv2.bitwise_and(mask, blue_any_shade_luminance_floor(bgr))
+        mask = _select_blue_cube_blob(mask, h, w)
     else:
         mask = _largest_connected_component(mask)
 
