@@ -22,6 +22,11 @@ PLAY_MAT_Z_ROBOT_M = (-0.12, 0.48)
 # Drop top of frame (ceiling / back wall); keep lower area where the mat usually is.
 PLAY_MAT_IMAGE_TOP_CROP_FRAC = 0.12
 
+# Blue only: arm/gripper often fills wide HSV blue; exclude bottom of frame + prefer cube-sized blobs.
+ROBOT_ARM_EXCLUDE_BOTTOM_FRAC_BLUE = 0.34
+BLUE_CC_MIN_AREA_PX = 100
+BLUE_CC_MAX_AREA_FRAC = 0.14
+
 
 def scale_xyz_to_meters_frame(xyz):
     """Same mm→m heuristic as ``checkpoint6.points_to_meters_open3d`` for a dense HxWx3 cloud."""
@@ -74,6 +79,64 @@ def image_arena_roi_mask(shape_hw):
     row = numpy.arange(h, dtype=numpy.int32)[:, None]
     keep = row >= int(PLAY_MAT_IMAGE_TOP_CROP_FRAC * h)
     return numpy.broadcast_to(keep, (h, shape_hw[1]))
+
+
+def image_exclude_bottom_frac_mask(shape_hw, frac):
+    """Boolean mask: False in the bottom ``frac`` of rows (robot arm / base strip)."""
+    h, w = shape_hw[0], shape_hw[1]
+    row = numpy.arange(h, dtype=numpy.int32)[:, None]
+    keep = row < int((1.0 - frac) * h)
+    return numpy.broadcast_to(keep, (h, w))
+
+
+def blue_bgr_dominance_mask(bgr_uint8):
+    """
+    Keep pixels where blue channel leads red/green (cube plastic), weakening gray metal arm.
+    """
+    b = bgr_uint8[:, :, 0].astype(numpy.int32)
+    g = bgr_uint8[:, :, 1].astype(numpy.int32)
+    r = bgr_uint8[:, :, 2].astype(numpy.int32)
+    return ((2 * b >= r + g - 8) & (b >= r - 3) & (b >= g - 3)).astype(numpy.uint8) * 255
+
+
+def _cube_sized_connected_component(mask_uint8, h, w):
+    """
+    Prefer a blob whose area matches a tabletop cube; skip arm-sized huge components.
+    If the largest blob is too big, use the next best under the cap.
+    """
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask_uint8, connectivity=8
+    )
+    if num <= 1:
+        return mask_uint8
+    img_area = float(h * w)
+    max_px = max(BLUE_CC_MIN_AREA_PX + 1, int(BLUE_CC_MAX_AREA_FRAC * img_area))
+    min_px = BLUE_CC_MIN_AREA_PX
+
+    best_id = None
+    best_area = 0
+    for i in range(1, num):
+        a = stats[i, cv2.CC_STAT_AREA]
+        if a < min_px or a > max_px:
+            continue
+        if a > best_area:
+            best_area = a
+            best_id = i
+
+    if best_id is not None:
+        return numpy.where(labels == best_id, 255, 0).astype(numpy.uint8)
+
+    areas = [(i, stats[i, cv2.CC_STAT_AREA]) for i in range(1, num)]
+    areas.sort(key=lambda x: -x[1])
+    if (
+        len(areas) >= 2
+        and areas[0][1] > max_px
+        and min_px <= areas[1][1] <= max_px
+    ):
+        i = areas[1][0]
+        return numpy.where(labels == i, 255, 0).astype(numpy.uint8)
+
+    return _largest_connected_component(mask_uint8)
 
 
 def prompt_to_color_name(cube_prompt):
@@ -147,11 +210,15 @@ def _hsv_ranges_for_color(color_name, relaxed=False):
 def color_mask_bgr(image_bgra, color_name, relaxed=False):
     """
     Binary mask for cube color: blur -> HSV -> union of ranges -> open/close ->
-    largest connected component -> light dilate (fills depth holes at edges).
+    connected component(s) -> light dilate.
+
+    For **blue**, drops the bottom image strip (arm/base), ANDs a BGR blue-dominance mask,
+    then keeps a **cube-sized** blob instead of the largest (often the arm).
     """
     bgr = image_bgra[:, :, :3]
     bgr = cv2.GaussianBlur(bgr, (5, 5), 0)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    h, w = hsv.shape[:2]
     mask = numpy.zeros(hsv.shape[:2], dtype=numpy.uint8)
     for lo, hi in _hsv_ranges_for_color(color_name, relaxed=relaxed):
         mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
@@ -159,7 +226,15 @@ def color_mask_bgr(image_bgra, color_name, relaxed=False):
     k5 = numpy.ones((5, 5), numpy.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k3, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5, iterations=2)
-    mask = _largest_connected_component(mask)
+
+    if color_name == "blue":
+        keep_bottom = image_exclude_bottom_frac_mask((h, w), ROBOT_ARM_EXCLUDE_BOTTOM_FRAC_BLUE)
+        mask = cv2.bitwise_and(mask, (keep_bottom.astype(numpy.uint8) * 255))
+        mask = cv2.bitwise_and(mask, blue_bgr_dominance_mask(bgr))
+        mask = _cube_sized_connected_component(mask, h, w)
+    else:
+        mask = _largest_connected_component(mask)
+
     mask = cv2.dilate(mask, k5, iterations=1)
     return mask > 0
 
