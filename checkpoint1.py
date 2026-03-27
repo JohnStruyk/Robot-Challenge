@@ -10,9 +10,9 @@ from checkpoint0 import get_transform_camera_robot
 GRIPPER_LENGTH = 0.067 * 1000
 CUBE_TAG_FAMILY = 'tag36h11'
 CUBE_TAG_ID = 4
-CUBE_TAG_SIZE = 0.02
+CUBE_TAG_SIZE = 0.0207
 
-robot_ip = '192.168.1.152'
+robot_ip = '192.168.1.182'
 
 # Motion constants (meters / degrees)
 SAFE_Z = 0.22

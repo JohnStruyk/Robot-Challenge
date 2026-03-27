@@ -49,7 +49,7 @@ def main():
 
         # TODO
         # Locate the RED cube 
-        res_red = cube_pose_detector.get_transforms(cv_image, "blue cube")
+        res_red = cube_pose_detector.get_transforms(cv_image, "red cube")
         
         # Locate the GREEN cube
         res_green = cube_pose_detector.get_transforms(cv_image, "green cube")
