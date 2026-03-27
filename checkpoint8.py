@@ -25,34 +25,166 @@ def prompt_to_color_name(cube_prompt):
     raise ValueError(f"Prompt must mention red, green, or blue: {cube_prompt!r}")
 
 
-def color_mask_bgr(image_bgra, color_name):
+def _largest_connected_component(mask_uint8):
+    """Keep the largest 8-connected foreground blob; reduces stray specular hits."""
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask_uint8, connectivity=8
+    )
+    if num <= 1:
+        return mask_uint8
+    best = 1
+    best_area = stats[1, cv2.CC_STAT_AREA]
+    for i in range(2, num):
+        if stats[i, cv2.CC_STAT_AREA] > best_area:
+            best_area = stats[i, cv2.CC_STAT_AREA]
+            best = i
+    out = numpy.zeros_like(mask_uint8)
+    out[labels == best] = 255
+    return out
+
+
+def _hsv_ranges_for_color(color_name, relaxed=False):
     """
-    Build a binary mask for the given cube color in the BGRA image (HSV thresholds).
+    HSV inRange tuples for OpenCV. ``relaxed`` widens S/V and hue bands for hard scenes.
+    """
+    lo_s, hi_s = (40, 255) if not relaxed else (25, 255)
+    lo_v, hi_v = (35, 255) if not relaxed else (20, 255)
+    if color_name == "red":
+        return [
+            ((0, lo_s, lo_v), (15 if not relaxed else 18, hi_s, hi_v)),
+            ((160 if not relaxed else 155, lo_s, lo_v), (179, hi_s, hi_v)),
+        ]
+    if color_name == "green":
+        return [((32 if not relaxed else 28, lo_s, lo_v), (95 if not relaxed else 98, hi_s, hi_v))]
+    if color_name == "blue":
+        return [((85 if not relaxed else 80, lo_s, lo_v), (138 if not relaxed else 142, hi_s, hi_v))]
+    raise ValueError(color_name)
+
+
+def color_mask_bgr(image_bgra, color_name, relaxed=False):
+    """
+    Binary mask for cube color: blur -> HSV -> union of ranges -> open/close ->
+    largest connected component -> light dilate (fills depth holes at edges).
     """
     bgr = image_bgra[:, :, :3]
+    bgr = cv2.GaussianBlur(bgr, (5, 5), 0)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     mask = numpy.zeros(hsv.shape[:2], dtype=numpy.uint8)
-    if color_name == "red":
-        mask = cv2.bitwise_or(mask, cv2.inRange(hsv, (0, 70, 50), (12, 255, 255)))
-        mask = cv2.bitwise_or(mask, cv2.inRange(hsv, (165, 70, 50), (179, 255, 255)))
-    elif color_name == "green":
-        mask = cv2.inRange(hsv, (35, 50, 50), (92, 255, 255))
-    elif color_name == "blue":
-        mask = cv2.inRange(hsv, (90, 50, 50), (135, 255, 255))
-    else:
-        raise ValueError(color_name)
-    kernel = numpy.ones((5, 5), numpy.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.dilate(mask, kernel, iterations=1)
+    for lo, hi in _hsv_ranges_for_color(color_name, relaxed=relaxed):
+        mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
+    k3 = numpy.ones((3, 3), numpy.uint8)
+    k5 = numpy.ones((5, 5), numpy.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k3, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5, iterations=2)
+    mask = _largest_connected_component(mask)
+    mask = cv2.dilate(mask, k5, iterations=1)
     return mask > 0
+
+
+def orthonormalize_rotation(R):
+    """Project a 3x3 matrix to SO(3) (stable draw / grasp)."""
+    U, _, Vt = numpy.linalg.svd(R)
+    Rn = U @ Vt
+    if numpy.linalg.det(Rn) < 0:
+        U[:, -1] *= -1.0
+        Rn = U @ Vt
+    return Rn
+
+
+def isolate_masked_color_cube_open3d(pcd: o3d.geometry.PointCloud):
+    """
+    Segment a **color-masked** cube cloud. Skips RANSAC plane removal (no table in mask).
+
+    Uses tighter voxel / DBSCAN than :func:`checkpoint6.isolate_cube_cluster_open3d`,
+    which is tuned for full-scene tabletop data.
+    """
+    if len(pcd.points) < 32:
+        return None, "too few masked points"
+
+    pcd = pcd.voxel_down_sample(voxel_size=0.002)
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=15, std_ratio=2.0)
+    if len(pcd.points) < 22:
+        return None, "too few after voxel/outlier (masked)"
+
+    labels = numpy.asarray(
+        pcd.cluster_dbscan(eps=0.014, min_points=10, print_progress=False)
+    )
+    max_label = int(labels.max()) if labels.size else -1
+
+    def score_cluster(cluster):
+        obb = cluster.get_oriented_bounding_box()
+        ext = numpy.sort(numpy.asarray(obb.extent))
+        if ext[2] < 1e-9:
+            return -1.0, None
+        max_dim = float(ext[2])
+        mid_dim = float(ext[1])
+        min_dim = float(ext[0])
+        compact = min_dim / max_dim if max_dim > 0 else 0.0
+        # Prefer compact ~cube-ish boxes in expected size band (lab cubes ~2–5 cm).
+        size_ok = 0.007 <= max_dim <= 0.12
+        span_ok = abs(max_dim - mid_dim) / max_dim < 0.75 if max_dim > 1e-6 else False
+        qual = 1.0 if size_ok else 0.15
+        qual *= 1.0 if (0.2 < compact <= 1.0) else 0.4
+        qual *= 1.1 if span_ok else 0.85
+        return float(len(cluster.points)) * compact * qual, cluster
+
+    if max_label < 0:
+        # DBSCAN marked everything noise — often one tight blob; use whole cloud.
+        sc, chosen = score_cluster(pcd)
+        if chosen is not None and sc > 0:
+            return pcd, "masked monolithic blob"
+        return pcd, "masked blob (weak score)"
+
+    best_cluster = None
+    best_score = -1.0
+    fallback_largest = None
+    fallback_n = 0
+
+    for cid in range(max_label + 1):
+        idx = numpy.where(labels == cid)[0]
+        if idx.size < 12:
+            continue
+        cluster = pcd.select_by_index(idx)
+        sc, chosen = score_cluster(cluster)
+        if idx.size > fallback_n:
+            fallback_n = idx.size
+            fallback_largest = cluster
+        if sc > best_score and chosen is not None:
+            best_score = sc
+            best_cluster = chosen
+
+    if best_cluster is not None:
+        return best_cluster, "masked DBSCAN cluster"
+
+    if fallback_largest is not None and len(fallback_largest.points) >= 18:
+        return fallback_largest, "masked fallback: largest cluster"
+
+    return None, "no masked cluster"
+
+
+def camera_pose_from_cluster_pcd(cube_pcd: o3d.geometry.PointCloud):
+    """
+    Cube pose in camera frame: blend OBB center with point centroid (reduces depth noise),
+    rotation from OBB with SVD projection to SO(3).
+    """
+    pts = numpy.asarray(cube_pcd.points)
+    centroid = pts.mean(axis=0)
+    obb = cube_pcd.get_oriented_bounding_box()
+    c_obb = numpy.asarray(obb.center)
+    center = 0.62 * centroid + 0.38 * c_obb
+    R = orthonormalize_rotation(numpy.asarray(obb.R))
+    t_cam_cube = numpy.eye(4)
+    t_cam_cube[:3, :3] = R
+    t_cam_cube[:3, 3] = center
+    return t_cam_cube
 
 
 class CubePoseDetector:
     """
-    Pure-vision target selection: prompt -> 2D color mask -> masked 3D points -> OBB (Open3D).
+    Pure-vision target selection: prompt -> 2D color mask -> masked 3D points -> cluster -> pose.
 
-    Aligns with the PDF: combine color segmentation (checkpoint 3 style) with
-    point-cloud pose (checkpoint 6 style); filter NaNs before Open3D.
+    Uses a **masked** 3D pipeline (no table plane removal), relaxed HSV if needed,
+    and centroid/OBB-blended pose for steadier estimates than raw OBB alone.
     """
 
     def __init__(self, camera_intrinsic):
@@ -86,36 +218,44 @@ class CubePoseDetector:
         if image.shape[:2] != point_cloud.shape[:2]:
             return None, "image / point_cloud shape mismatch"
 
-        mask_2d = color_mask_bgr(image, color_name)
         xyz = point_cloud[..., :3]
         finite = numpy.isfinite(xyz).all(axis=-1)
+
+        min_pts = 55
+        mask_2d = color_mask_bgr(image, color_name, relaxed=False)
         combined = finite & mask_2d
         pts = xyz[combined]
+        seg_note = "strict mask"
+        if pts.shape[0] < min_pts:
+            mask_2d = color_mask_bgr(image, color_name, relaxed=True)
+            combined = finite & mask_2d
+            pts = xyz[combined]
+            seg_note = "relaxed mask"
 
-        if pts.shape[0] < 80:
-            return None, f"too few masked 3D points: {pts.shape[0]}"
+        if pts.shape[0] < min_pts:
+            return None, f"too few masked 3D points: {pts.shape[0]} ({seg_note})"
 
         pts_m, _ = points_to_meters_open3d(pts)
 
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts_m.astype(numpy.float64))
 
-        cube_pcd, seg_msg = isolate_cube_cluster_open3d(pcd)
-        if cube_pcd is None or len(cube_pcd.points) < 25:
-            return None, seg_msg
+        cube_pcd, seg_msg = isolate_masked_color_cube_open3d(pcd)
+        if cube_pcd is None or len(cube_pcd.points) < 18:
+            cube_pcd, seg_msg = isolate_cube_cluster_open3d(pcd)
+            seg_note = f"{seg_note}; fallback cp6: {seg_msg}"
+        else:
+            seg_note = f"{seg_note}; {seg_msg}"
 
-        obb = cube_pcd.get_oriented_bounding_box()
-        center = numpy.asarray(obb.center)
-        R_cam_cube = numpy.asarray(obb.R)
+        if cube_pcd is None or len(cube_pcd.points) < 15:
+            return None, seg_msg if cube_pcd is None else "cluster too small"
 
-        t_cam_cube = numpy.eye(4)
-        t_cam_cube[:3, :3] = R_cam_cube
-        t_cam_cube[:3, 3] = center
+        t_cam_cube = camera_pose_from_cluster_pcd(cube_pcd)
 
         t_robot_cam = numpy.linalg.inv(self.t_cam_robot)
         t_robot_cube = t_robot_cam @ t_cam_cube
 
-        return (t_robot_cube, t_cam_cube), f"{color_name}: {seg_msg}"
+        return (t_robot_cube, t_cam_cube), f"{color_name}: {seg_note}"
 
 
 def run_pure_vision_target_perception(
