@@ -41,6 +41,37 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     image, point_cloud = observation
 
     # TODO
+    # Get point cloud
+    xyz = point_cloud[..., :3] 
+
+    #  Filter out NANs
+    valid_mask = numpy.isfinite(xyz).all(axis=-1)
+    valid_points = xyz[valid_mask]
+
+    #  Build point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(valid_points)
+
+    if numpy.asarray(pcd.points).shape[0] < 50:
+        return None
+
+    # Fit oriented bounding box
+    obb = pcd.get_oriented_bounding_box()
+    center = numpy.asarray(obb.center) 
+    R_cam_cube = numpy.asarray(obb.R)         
+
+
+
+    # Build 4x4 transform in camera frame
+    t_cam_cube = numpy.eye(4)
+    t_cam_cube[:3, :3] = R_cam_cube
+    t_cam_cube[:3, 3] = center
+
+    # Transform to robot base frame: T_robot_cube = T_robot_cam @ T_cam_cube
+    t_robot_cube = camera_pose @ t_cam_cube
+
+    return t_robot_cube, t_cam_cube
+
 
 def main():
 
