@@ -6,11 +6,11 @@ from xarm.wrapper import XArmAPI
 from utils.vis_utils import draw_pose_axes
 from utils.zed_camera import ZedCamera
 from checkpoint0 import get_transform_camera_robot
-from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH
+from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
+
 
 CUBE_SIZE = 0.025
 
-robot_ip = ''
 
 def get_transform_cube(observation, camera_intrinsic, camera_pose):
     """
@@ -40,7 +40,6 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     """
     image, point_cloud = observation
 
-    # TODO
     # Get point cloud
     xyz = point_cloud[..., :3] 
 
@@ -93,9 +92,18 @@ def main():
         # Get Observation
         cv_image = zed.image
         point_cloud = zed.point_cloud
+        observation = (cv_image, point_cloud)
 
+        # Get Transformation
+        t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
+        if t_cam_robot is None:
+            return
+        
         t_cam_cube = None
-        # TODO
+        cube_result = get_transform_cube(observation, camera_intrinsic, t_cam_robot)
+        if cube_result is None:
+            return
+        t_robot_cube, t_cam_cube = cube_result
         
         # Visualization
         draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube)
@@ -107,10 +115,16 @@ def main():
         if key == ord('k'):
             cv2.destroyAllWindows()
 
-            # TODO
+            xyz = t_robot_cube[:3, 3]
+            print(f'Cube in robot frame (m): x={xyz[0]:.3f}, y={xyz[1]:.3f}, z={xyz[2]:.3f}')
+            grasp_cube(arm, t_robot_cube)
+            place_cube(arm, t_robot_cube)
+
+            arm.stop_lite6_gripper()
     
     finally:
         # Close Lite6 Robot
+        arm.stop_lite6_gripper()
         arm.move_gohome(wait=True)
         time.sleep(0.5)
         arm.disconnect()

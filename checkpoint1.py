@@ -12,13 +12,13 @@ CUBE_TAG_FAMILY = 'tag36h11'
 CUBE_TAG_ID = 4
 CUBE_TAG_SIZE = 0.02
 
-robot_ip = '192.168.1.152'
+robot_ip = '192.168.1.182'
 
 # Motion constants (meters / degrees)
 SAFE_Z = 0.22
 GRASP_Z_OFFSET = 0.0001
 LIFT_Z_DELTA = 0.06
-PLACE_Z_OFFSET = 0.002
+PLACE_Z_OFFSET = 0.02
 
 # Keep tool mostly vertical; only yaw is adapted from cube pose.
 TOOL_ROLL_DEG = 180.0
