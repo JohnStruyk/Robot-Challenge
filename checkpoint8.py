@@ -10,10 +10,70 @@ from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 from checkpoint6 import (
     draw_status_overlay,
     isolate_cube_cluster_open3d,
-    points_to_meters_open3d,
 )
 
 cube_prompt = "red cube"
+
+# Arena / play mat in world–robot frame (meters), aligned with checkpoint0 tag layout.
+# Tag centers span roughly x in [0, 0.38], y in [-0.4, 0.4]; margins keep walls / off-mat out.
+PLAY_MAT_X_ROBOT_M = (-0.10, 0.52)
+PLAY_MAT_Y_ROBOT_M = (-0.55, 0.55)
+PLAY_MAT_Z_ROBOT_M = (-0.12, 0.48)
+# Drop top of frame (ceiling / back wall); keep lower area where the mat usually is.
+PLAY_MAT_IMAGE_TOP_CROP_FRAC = 0.12
+
+
+def scale_xyz_to_meters_frame(xyz):
+    """Same mm→m heuristic as ``checkpoint6.points_to_meters_open3d`` for a dense HxWx3 cloud."""
+    valid = numpy.isfinite(xyz).all(axis=-1)
+    if not numpy.any(valid):
+        return xyz.astype(numpy.float64), 1.0
+    max_abs = float(numpy.nanmax(numpy.abs(xyz[valid])))
+    s = 0.001 if max_abs > 50.0 else 1.0
+    return (xyz * s).astype(numpy.float64), s
+
+
+def play_mat_workspace_mask(xyz_m, t_cam_robot):
+    """
+    Pixels whose 3D point lies on/near the arena in robot/world frame.
+
+    ``t_cam_robot`` is the OpenCV PnP world→camera matrix from checkpoint0
+    (same frame as ``TAG_CENTER_COORDINATES``). Points are transformed with
+    ``p_world = inv(t_cam_robot) @ p_cam``.
+    """
+    H, W = xyz_m.shape[:2]
+    finite = numpy.isfinite(xyz_m).all(axis=-1)
+    T_wc = numpy.linalg.inv(t_cam_robot)
+    flat = xyz_m.reshape(-1, 3)
+    f = finite.reshape(-1)
+    out = numpy.zeros(H * W, dtype=bool)
+    idx = numpy.flatnonzero(f)
+    if idx.size == 0:
+        return out.reshape(H, W)
+    ph = numpy.ones((idx.size, 4), dtype=numpy.float64)
+    ph[:, :3] = flat[idx]
+    pw = (T_wc @ ph.T).T[:, :3]
+    x0, x1 = PLAY_MAT_X_ROBOT_M
+    y0, y1 = PLAY_MAT_Y_ROBOT_M
+    z0, z1 = PLAY_MAT_Z_ROBOT_M
+    inside = (
+        (pw[:, 0] >= x0)
+        & (pw[:, 0] <= x1)
+        & (pw[:, 1] >= y0)
+        & (pw[:, 1] <= y1)
+        & (pw[:, 2] >= z0)
+        & (pw[:, 2] <= z1)
+    )
+    out[idx] = inside
+    return out.reshape(H, W)
+
+
+def image_arena_roi_mask(shape_hw):
+    """Boolean mask: keep rows below the top crop (table / mat region vs wall strip)."""
+    h = shape_hw[0]
+    row = numpy.arange(h, dtype=numpy.int32)[:, None]
+    keep = row >= int(PLAY_MAT_IMAGE_TOP_CROP_FRAC * h)
+    return numpy.broadcast_to(keep, (h, shape_hw[1]))
 
 
 def prompt_to_color_name(cube_prompt):
@@ -204,10 +264,11 @@ def camera_pose_from_cluster_pcd(cube_pcd: o3d.geometry.PointCloud):
 
 class CubePoseDetector:
     """
-    Pure-vision target selection: prompt -> 2D color mask -> masked 3D points -> cluster -> pose.
+    Pure-vision target selection: prompt -> 2D color mask -> arena workspace + ROI ->
+    masked 3D points -> cluster -> pose.
 
-    Uses a **masked** 3D pipeline (no table plane removal), relaxed HSV if needed,
-    and centroid/OBB-blended pose for steadier estimates than raw OBB alone.
+    Color hits outside the AprilTag-defined play mat (or in the top image strip) are
+    dropped so background walls / clutter are ignored.
     """
 
     def __init__(self, camera_intrinsic):
@@ -242,26 +303,31 @@ class CubePoseDetector:
             return None, "image / point_cloud shape mismatch"
 
         xyz = point_cloud[..., :3]
-        finite = numpy.isfinite(xyz).all(axis=-1)
+        xyz_m, _ = scale_xyz_to_meters_frame(xyz)
+        finite = numpy.isfinite(xyz_m).all(axis=-1)
+
+        ws = play_mat_workspace_mask(xyz_m, self.t_cam_robot)
+        roi = image_arena_roi_mask(image.shape)
+        scene = finite & ws & roi
 
         min_pts = 55
         mask_2d = color_mask_bgr(image, color_name, relaxed=False)
-        combined = finite & mask_2d
-        pts = xyz[combined]
-        seg_note = "strict mask"
+        combined = scene & mask_2d
+        pts = xyz_m[combined]
+        seg_note = "strict mask+arena"
         if pts.shape[0] < min_pts:
             mask_2d = color_mask_bgr(image, color_name, relaxed=True)
-            combined = finite & mask_2d
-            pts = xyz[combined]
-            seg_note = "relaxed mask"
+            combined = scene & mask_2d
+            pts = xyz_m[combined]
+            seg_note = "relaxed mask+arena"
 
         if pts.shape[0] < min_pts:
-            return None, f"too few masked 3D points: {pts.shape[0]} ({seg_note})"
-
-        pts_m, _ = points_to_meters_open3d(pts)
+            return None, (
+                f"too few points on play mat: {pts.shape[0]} ({seg_note})"
+            )
 
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts_m.astype(numpy.float64))
+        pcd.points = o3d.utility.Vector3dVector(pts.astype(numpy.float64))
 
         cube_pcd, seg_msg = isolate_masked_color_cube_open3d(pcd)
         if cube_pcd is None or len(cube_pcd.points) < 18:
