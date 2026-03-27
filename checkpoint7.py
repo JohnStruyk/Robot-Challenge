@@ -33,8 +33,16 @@ def main():
         point_cloud = zed.point_cloud
 
         t_cam_cube = None
-        # TODO
-        
+        # From Checkpoint 2
+        t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
+        if t_cam_robot is None:
+            return
+
+        cube_result = get_transform_cube(cv_image, camera_intrinsic, t_cam_robot)
+        if cube_result is None:
+            return
+        t_robot_cube, t_cam_cube = cube_result
+
         # Visualization
         draw_pose_axes(cv_image, camera_intrinsic, t_cam_cube)
         cv2.namedWindow('Verifying Cube Pose', cv2.WINDOW_NORMAL)
@@ -45,7 +53,9 @@ def main():
         if key == ord('k'):
             cv2.destroyAllWindows()
 
-            # TODO
+            # From checkpoint 2
+            grasp_cube(arm, t_robot_cube)
+            place_in_basket(arm, BASKET_POSE, vaccum_gripper=False)
     
     finally:
         # Close Lite6 Robot
