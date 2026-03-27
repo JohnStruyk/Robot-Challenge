@@ -16,9 +16,9 @@ robot_ip = '192.168.1.182'
 
 # Motion constants (meters / degrees)
 SAFE_Z = 0.22
-GRASP_Z_OFFSET = 0.0001
+GRASP_Z_OFFSET = 0.01
 LIFT_Z_DELTA = 0.06
-PLACE_Z_OFFSET = 0.002
+PLACE_Z_OFFSET = 0.01
 
 # Keep tool mostly vertical; only yaw is adapted from cube pose.
 TOOL_ROLL_DEG = 180.0
