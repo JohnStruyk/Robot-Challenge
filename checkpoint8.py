@@ -13,7 +13,7 @@ from checkpoint6 import (
     points_to_meters_open3d,
 )
 
-cube_prompt = "blue cube"
+cube_prompt = "red cube"
 
 
 def prompt_to_color_name(cube_prompt):
