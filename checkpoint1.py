@@ -18,7 +18,7 @@ robot_ip = '192.168.1.182'
 SAFE_Z = 0.22
 GRASP_Z_OFFSET = 0.0001
 LIFT_Z_DELTA = 0.06
-PLACE_Z_OFFSET = 0.02
+PLACE_Z_OFFSET = 0.002
 
 # Keep tool mostly vertical; only yaw is adapted from cube pose.
 TOOL_ROLL_DEG = 180.0
