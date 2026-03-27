@@ -126,14 +126,14 @@ def _hsv_ranges_for_color(color_name, relaxed=False):
         ]
 
     if color_name == "blue":
-        # Dark / navy cubes: low V; shared green/red floors were too bright (lo_v 35).
-        # Allow moderate S so desaturated navy still segments vs black background.
+        # Wide blue band: cyan→blue→blue-violet; low S/V floors for navy / matte / dim lighting.
+        # OpenCV H in [0,179]: ~60–100 cyan/teal, ~100–130 blue, ~130–170 purple-magenta.
         if relaxed:
-            lo_s, lo_v = 22, 12
-            h_lo, h_hi = 76, 152
+            lo_s, lo_v = 10, 5
+            h_lo, h_hi = 55, 175
         else:
-            lo_s, lo_v = 38, 20
-            h_lo, h_hi = 80, 146
+            lo_s, lo_v = 18, 10
+            h_lo, h_hi = 62, 168
         hi_s, hi_v = 255, 255
         return [((h_lo, lo_s, lo_v), (h_hi, hi_s, hi_v))]
 
