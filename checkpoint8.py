@@ -47,8 +47,8 @@ def _hsv_ranges_for_color(color_name, relaxed=False):
     """
     HSV inRange tuples for OpenCV. ``relaxed`` widens S/V and hue bands for hard scenes.
 
-    **Red** uses its own floors on S/V: brown / wood / dark mud sit in a similar hue wedge
-    but with low saturation or very low value; vivid red cubes stay saturated and brighter.
+    **Red** and **blue** use color-specific S/V floors (brown rejection vs dark-navy capture).
+    Green still uses the shared defaults below.
     """
     if color_name == "red":
         # Strict: drop dull browns (low S) and near-black (low V).
@@ -65,12 +65,22 @@ def _hsv_ranges_for_color(color_name, relaxed=False):
             ((h_high_start, lo_s, lo_v), (179, hi_s, hi_v)),
         ]
 
+    if color_name == "blue":
+        # Dark / navy cubes: low V; shared green/red floors were too bright (lo_v 35).
+        # Allow moderate S so desaturated navy still segments vs black background.
+        if relaxed:
+            lo_s, lo_v = 22, 12
+            h_lo, h_hi = 76, 152
+        else:
+            lo_s, lo_v = 38, 20
+            h_lo, h_hi = 80, 146
+        hi_s, hi_v = 255, 255
+        return [((h_lo, lo_s, lo_v), (h_hi, hi_s, hi_v))]
+
     lo_s, hi_s = (40, 255) if not relaxed else (25, 255)
     lo_v, hi_v = (35, 255) if not relaxed else (20, 255)
     if color_name == "green":
         return [((32 if not relaxed else 28, lo_s, lo_v), (95 if not relaxed else 98, hi_s, hi_v))]
-    if color_name == "blue":
-        return [((85 if not relaxed else 80, lo_s, lo_v), (138 if not relaxed else 142, hi_s, hi_v))]
     raise ValueError(color_name)
 
 
