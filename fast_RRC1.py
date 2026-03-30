@@ -8,6 +8,7 @@ import numpy
 import open3d as o3d
 from scipy.spatial.transform import Rotation
 from xarm.wrapper import XArmAPI
+from pupil_apriltags import Detector
 
 from utils.zed_camera import ZedCamera
 from checkpoint1 import robot_ip
@@ -41,8 +42,31 @@ def get_transform_camera_robot(observation, camera_intrinsic):
     Inputs: observation — camera image (unused); camera_intrinsic — intrinsics (unused).
     Outputs: identity 4x4 transform.
     """
-    _ = observation, camera_intrinsic
-    return numpy.eye(4)
+
+  # Initialize AprilTag Detector
+    detector = Detector(families='tag36h11')
+
+    # Detect AprilTag Points
+    if len(observation.shape) > 2:
+        observation = cv2.cvtColor(observation, cv2.COLOR_BGRA2GRAY)
+    tags = detector.detect(observation, estimate_tag_pose=False)
+    print(f'Number of tags found: {len(tags)}')
+    world_points, image_points = get_pnp_pairs(tags)
+    if world_points.shape[0] < 4:
+        print(f'Insufficient valid tag corners found.')
+        return None
+
+    # Get Transformation
+    success, rotation_vec, translation = cv2.solvePnP(world_points, image_points, camera_intrinsic, None)
+    if success is not True:
+        print('PnP Calculation Failed.')
+        return None
+    rotation_mat, _ = cv2.Rodrigues(rotation_vec)
+    transform_mat = numpy.eye(4)
+    transform_mat[:3, :3] = rotation_mat
+    transform_mat[:3, 3] = translation.flatten()
+
+    return transform_mat
 
 
 #################################################################### Geometry helpers
