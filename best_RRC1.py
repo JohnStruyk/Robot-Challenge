@@ -3,6 +3,7 @@ import numpy
 import open3d as o3d
 from scipy.spatial.transform import Rotation
 from xarm.wrapper import XArmAPI
+import time
 
 from checkpoint0 import get_transform_camera_robot
 from checkpoint1 import GRIPPER_LENGTH, robot_ip
