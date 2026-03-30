@@ -7,7 +7,7 @@ import open3d as o3d
 from scipy.spatial.transform import Rotation
 from xarm.wrapper import XArmAPI
 
-from checkpoint1 import GRIPPER_LENGTH, grasp_cube, place_cube, robot_ip
+from checkpoint1 import GRIPPER_LENGTH, robot_ip
 from checkpoint4 import STACK_HEIGHT
 from utils.vis_utils import draw_pose_axes
 from utils.zed_camera import ZedCamera
@@ -29,6 +29,16 @@ DBSCAN_EPS_M = 0.018
 DBSCAN_MIN_PTS = 40
 CUBE_MIN_M = 0.018
 CUBE_MAX_M = 0.080
+SAFE_Z_M = 0.22
+GRASP_Z_OFFSET_M = 0.0001
+PLACE_Z_OFFSET_M = 0.002
+LIFT_Z_DELTA_M = 0.06
+TOOL_ROLL_DEG = 180.0
+TOOL_PITCH_DEG = 0.0
+# Fast everywhere except final place descent.
+ARM_SPEED_FAST = 3000
+ARM_SPEED_PLACE = 140
+GRIPPER_SETTLE_S = 0.30
 
 
 def get_camera_to_robot_transform():
@@ -252,6 +262,69 @@ def make_stack_pose(base_pose, stack_index):
     return t
 
 
+def move_line(arm, x_mm, y_mm, z_mm, yaw_deg, speed):
+    """Move robot TCP to one Cartesian point with explicit speed.
+
+    Inputs: arm, xyz in mm, yaw in deg, speed in mm/s.
+    Outputs: none.
+    """
+    arm.set_position(
+        x_mm,
+        y_mm,
+        z_mm,
+        TOOL_ROLL_DEG,
+        TOOL_PITCH_DEG,
+        yaw_deg,
+        speed=speed,
+        is_radian=False,
+        wait=True,
+    )
+
+
+def grasp_cube_fast(arm, cube_pose):
+    """Fast pick: open, approach, descend, grip, lift.
+
+    Inputs: arm, cube_pose (4x4 meters).
+    Outputs: none.
+    """
+    xyz = cube_pose[:3, 3]
+    x_mm, y_mm, z_mm = (xyz * 1000.0).tolist()
+    safe_z_mm = SAFE_Z_M * 1000.0
+    grasp_z_mm = z_mm + (GRASP_Z_OFFSET_M * 1000.0)
+    lift_z_mm = max(safe_z_mm, grasp_z_mm + (LIFT_Z_DELTA_M * 1000.0))
+    cube_r = Rotation.from_matrix(cube_pose[:3, :3])
+    _, _, cube_yaw_deg = cube_r.as_euler("xyz", degrees=True)
+
+    arm.open_lite6_gripper()
+    time.sleep(GRIPPER_SETTLE_S)
+    move_line(arm, x_mm, y_mm, safe_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
+    move_line(arm, x_mm, y_mm, grasp_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
+    arm.close_lite6_gripper()
+    time.sleep(GRIPPER_SETTLE_S)
+    move_line(arm, x_mm, y_mm, lift_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
+
+
+def place_cube_fast(arm, cube_pose):
+    """Place with fast travel and slow final descent for stability.
+
+    Inputs: arm, cube_pose (4x4 meters).
+    Outputs: none.
+    """
+    xyz = cube_pose[:3, 3]
+    x_mm, y_mm, z_mm = (xyz * 1000.0).tolist()
+    safe_z_mm = SAFE_Z_M * 1000.0
+    place_z_mm = z_mm + (PLACE_Z_OFFSET_M * 1000.0)
+    lift_z_mm = max(safe_z_mm, place_z_mm + (LIFT_Z_DELTA_M * 1000.0))
+    cube_r = Rotation.from_matrix(cube_pose[:3, :3])
+    _, _, cube_yaw_deg = cube_r.as_euler("xyz", degrees=True)
+
+    move_line(arm, x_mm, y_mm, safe_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
+    move_line(arm, x_mm, y_mm, place_z_mm, cube_yaw_deg, ARM_SPEED_PLACE)
+    arm.open_lite6_gripper()
+    time.sleep(GRIPPER_SETTLE_S)
+    move_line(arm, x_mm, y_mm, lift_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
+
+
 def run_tower_sequence(arm, detected):
     """Stack detected cubes at a fixed stage XY, sorted by proximity.
 
@@ -267,18 +340,18 @@ def run_tower_sequence(arm, detected):
     Y_STAGE = -305.5 / 1000.0
 
     first = detected[0]["t_robot"]
-    grasp_cube(arm, first)
+    grasp_cube_fast(arm, first)
     base = numpy.copy(first)
     base[0, 3] = X_STAGE
     base[1, 3] = Y_STAGE
-    place_cube(arm, base)
+    place_cube_fast(arm, base)
     arm.stop_lite6_gripper()
     placed = 1
 
     for k, d in enumerate(detected[1:], start=1):
-        grasp_cube(arm, d["t_robot"])
+        grasp_cube_fast(arm, d["t_robot"])
         tgt = make_stack_pose(base, k)
-        place_cube(arm, tgt)
+        place_cube_fast(arm, tgt)
         arm.stop_lite6_gripper()
         placed += 1
     return placed
