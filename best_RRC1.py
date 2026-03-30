@@ -15,7 +15,9 @@ from utils.zed_camera import ZedCamera
 # Speed profile from mask_RRC.py: fast except final place descent.
 ARM_SPEED_FAST = 3000
 ARM_SPEED_PLACE = 140
+ARM_SPEED_GRASP_DOWN = 220
 GRIPPER_SETTLE_S = 0.30
+RELEASE_WAIT_S = 0.80
 
 SAFE_Z_M = 0.22
 GRASP_Z_OFFSET_M = 0.0001
@@ -81,7 +83,13 @@ def isolate_cube_cluster_open3d(pcd, num_cubes):
     if len(pcd.points) < 100:
         return None, "too few points after voxel/outlier"
 
-    _plane_model, inliers = pcd.segment_plane(distance_threshold=0.010, ransac_n=3, num_iterations=1500)
+    plane_model, inliers = pcd.segment_plane(distance_threshold=0.010, ransac_n=3, num_iterations=1500)
+    plane_n = numpy.asarray(plane_model[:3], dtype=numpy.float64)
+    nrm = numpy.linalg.norm(plane_n)
+    if nrm > 1e-9:
+        plane_n /= nrm
+    else:
+        plane_n = None
     if len(inliers) > 0 and len(inliers) > 0.12 * len(pcd.points):
         pcd = pcd.select_by_index(inliers, invert=True)
     if len(pcd.points) < 80:
@@ -120,16 +128,16 @@ def isolate_cube_cluster_open3d(pcd, num_cubes):
 
     scored_clusters.sort(key=lambda x: x[0], reverse=True)
     if scored_clusters:
-        return [c for _, c in scored_clusters[:num_cubes]], f"{min(num_cubes, len(scored_clusters))} cube-like clusters"
+        return [c for _, c in scored_clusters[:num_cubes]], plane_n, f"{min(num_cubes, len(scored_clusters))} cube-like clusters"
 
     fallback_clusters.sort(key=lambda x: x[0], reverse=True)
     top_clusters = [c for _, c in fallback_clusters[:num_cubes] if len(c.points) >= 40]
     if top_clusters:
-        return top_clusters, f"fallback: {len(top_clusters)} largest clusters"
-    return None, "no cluster passed filters"
+        return top_clusters, plane_n, f"fallback: {len(top_clusters)} largest clusters"
+    return None, plane_n, "no cluster passed filters"
 
 
-def get_cube_transform(cube_pcd, camera_pose):
+def get_cube_transform(cube_pcd, camera_pose, plane_normal_cam):
     """Compute (robot, camera) cube transforms from one segmented cluster.
 
     Inputs: cluster cloud, camera pose 4x4.
@@ -138,9 +146,48 @@ def get_cube_transform(cube_pcd, camera_pose):
     if cube_pcd is None or len(cube_pcd.points) < 30:
         return None
     obb = cube_pcd.get_oriented_bounding_box()
+    pts = numpy.asarray(cube_pcd.points)
+    center_med = numpy.median(pts, axis=0)
+    center_obb = numpy.asarray(obb.center)
+    center = 0.75 * center_med + 0.25 * center_obb
+
+    R_obb = numpy.asarray(obb.R)
+    if plane_normal_cam is not None and numpy.linalg.norm(plane_normal_cam) > 1e-9:
+        z_axis = plane_normal_cam / numpy.linalg.norm(plane_normal_cam)
+    else:
+        axes = [R_obb[:, 0], R_obb[:, 1], R_obb[:, 2]]
+        z_axis = max(axes, key=lambda a: abs(float(a[2])))
+        if z_axis[2] < 0:
+            z_axis = -z_axis
+
+    q = pts - center[None, :]
+    q_plane = q - (q @ z_axis)[:, None] * z_axis[None, :]
+    if q_plane.shape[0] >= 3:
+        cov = q_plane.T @ q_plane / max(q_plane.shape[0] - 1, 1)
+        w, v = numpy.linalg.eigh(cov)
+        x_axis = v[:, int(numpy.argmax(w))]
+    else:
+        x_axis = R_obb[:, 0]
+    x_axis = x_axis - numpy.dot(x_axis, z_axis) * z_axis
+    if numpy.linalg.norm(x_axis) < 1e-9:
+        tmp = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float64)
+        if abs(float(numpy.dot(tmp, z_axis))) > 0.9:
+            tmp = numpy.array([0.0, 1.0, 0.0], dtype=numpy.float64)
+        x_axis = tmp - numpy.dot(tmp, z_axis) * z_axis
+    x_axis /= (numpy.linalg.norm(x_axis) + 1e-12)
+    y_axis = numpy.cross(z_axis, x_axis)
+    y_axis /= (numpy.linalg.norm(y_axis) + 1e-12)
+    R = numpy.column_stack([x_axis, y_axis, z_axis])
+    # SO(3) projection
+    u, _, vt = numpy.linalg.svd(R)
+    R = u @ vt
+    if numpy.linalg.det(R) < 0:
+        u[:, -1] *= -1.0
+        R = u @ vt
+
     t_cam_cube = numpy.eye(4)
-    t_cam_cube[:3, :3] = numpy.asarray(obb.R)
-    t_cam_cube[:3, 3] = numpy.asarray(obb.center)
+    t_cam_cube[:3, :3] = R
+    t_cam_cube[:3, 3] = center
     t_robot_cam = numpy.linalg.inv(camera_pose)
     t_robot_cube = t_robot_cam @ t_cam_cube
     return t_robot_cube, t_cam_cube
@@ -176,13 +223,13 @@ class CubePoseDetector:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts.astype(numpy.float64))
 
-        clusters, msg = isolate_cube_cluster_open3d(pcd, num_cubes=max_cubes)
+        clusters, plane_n, msg = isolate_cube_cluster_open3d(pcd, num_cubes=max_cubes)
         if not clusters:
             return None, msg, pcd
 
         out = []
         for c in clusters:
-            tr = get_cube_transform(c, self.t_cam_robot)
+            tr = get_cube_transform(c, self.t_cam_robot, plane_n)
             if tr is not None:
                 out.append(tr)
         if not out:
@@ -226,7 +273,8 @@ def grasp_cube_fast(arm, cube_pose):
     arm.open_lite6_gripper()
     time.sleep(GRIPPER_SETTLE_S)
     move_line(arm, x_mm, y_mm, safe_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
-    move_line(arm, x_mm, y_mm, grasp_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
+    # Slower final pickup descent for reliable alignment.
+    move_line(arm, x_mm, y_mm, grasp_z_mm, cube_yaw_deg, ARM_SPEED_GRASP_DOWN)
     arm.close_lite6_gripper()
     time.sleep(GRIPPER_SETTLE_S)
     move_line(arm, x_mm, y_mm, lift_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
@@ -249,8 +297,26 @@ def place_cube_fast(arm, cube_pose):
     move_line(arm, x_mm, y_mm, safe_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
     move_line(arm, x_mm, y_mm, place_z_mm, cube_yaw_deg, ARM_SPEED_PLACE)
     arm.open_lite6_gripper()
-    time.sleep(GRIPPER_SETTLE_S)
+    time.sleep(RELEASE_WAIT_S)
     move_line(arm, x_mm, y_mm, lift_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
+
+
+def stop_arm_now(arm):
+    """Immediately stop the arm and gripper when user presses 't'."""
+    try:
+        arm.stop_lite6_gripper()
+    except Exception:
+        pass
+    if hasattr(arm, "emergency_stop"):
+        try:
+            arm.emergency_stop()
+            return
+        except Exception:
+            pass
+    try:
+        arm.set_state(4)
+    except Exception:
+        pass
 
 
 def run_tower_sequence(arm, poses_robot):
@@ -275,6 +341,9 @@ def run_tower_sequence(arm, poses_robot):
     arm.stop_lite6_gripper()
 
     for k, name in enumerate(names[1:], start=1):
+        if cv2.waitKey(1) == ord("t"):
+            stop_arm_now(arm)
+            return
         grasp_cube_fast(arm, poses_robot[name])
         tgt = numpy.copy(base)
         tgt[2, 3] += k * STACK_HEIGHT
@@ -332,6 +401,12 @@ def main():
     cv2.imshow("best_RRC1 preview", disp)
     key = cv2.waitKey(0)
     cv2.destroyAllWindows()
+
+    if key == ord("t"):
+        stop_arm_now(arm)
+        arm.disconnect()
+        zed.close()
+        return
 
     if ok and key == ord("k"):
         run_tower_sequence(arm, poses_robot)
