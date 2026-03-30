@@ -47,7 +47,7 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud):
         return None, "nothing left after plane removal"
 
     labels = numpy.asarray(
-        pcd.cluster_dbscan(eps=0.020, min_points=25, print_progress=False)
+        pcd.cluster_dbscan(eps=0.020, min_points=50, print_progress=False)
     )
     max_label = int(labels.max()) if labels.size else -1
     if max_label < 0:
