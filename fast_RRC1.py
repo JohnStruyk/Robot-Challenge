@@ -9,6 +9,27 @@ from checkpoint0 import get_transform_camera_robot
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 from checkpoint4 import STACK_HEIGHT
 
+# ---------- simple fast mask from depth ----------
+
+def simple_depth_mask(cloud, min_z=0.1, max_z=1.0):
+    """
+    Very fast 2D mask: white where depth is between min_z and max_z.
+    This shows approximate cube shapes without DBSCAN.
+    """
+    if cloud is None:
+        return None
+
+    depth = cloud[..., 2]  # Z in meters
+    mask = (depth > min_z) & (depth < max_z)
+
+    mask_img = numpy.zeros((*mask.shape, 3), dtype=numpy.uint8)
+    mask_img[mask] = (255, 255, 255)
+
+    # Optional smoothing
+    mask_img = cv2.medianBlur(mask_img, 5)
+
+    return mask_img
+
 # ---------- geometry helpers ----------
 
 def scale_xyz_to_meters_frame(xyz):
@@ -17,89 +38,59 @@ def scale_xyz_to_meters_frame(xyz):
     print(f"[scale_xyz] max abs={m:.3f}, scale={s}")
     return xyz * s, s
 
-def segment_top_n_cubes_open3d(pts, labels_flat, max_cubes=3, cube_min=0.02, cube_max=0.06):
-    """
-    pts: (N,3) finite 3D points in meters
-    labels_flat: (N,) cluster labels from DBSCAN on pts
-    """
-    print(f"[segment] input finite points: {pts.shape[0]}")
+def segment_top_n_cubes_open3d(pcd, max_cubes=3, cube_min=0.02, cube_max=0.06):
+    print(f"[segment] input points: {len(pcd.points)}")
+    pcd = pcd.voxel_down_sample(0.003)
+    print(f"[segment] after voxel: {len(pcd.points)}")
+    pcd, _ = pcd.remove_statistical_outlier(25, 2.0)
+    print(f"[segment] after outlier: {len(pcd.points)}")
 
-    if pts.shape[0] == 0 or labels_flat.size == 0:
-        print("[segment] no points or labels")
+    if len(pcd.points) == 0:
+        print("[segment] no points after filtering")
         return [], "empty"
 
-    if labels_flat.max() < 0:
-        print("[segment] no valid cluster labels")
+    plane, inliers = pcd.segment_plane(0.01, 3, 1500)
+    if len(inliers) > 0.1 * len(pcd.points):
+        pcd = pcd.select_by_index(inliers, invert=True)
+
+    labels = numpy.asarray(pcd.cluster_dbscan(0.02, 25))
+    if labels.size == 0 or labels.max() < 0:
         return [], "no clusters"
 
-    # Build a single point cloud for selecting clusters
-    pcd_full = o3d.geometry.PointCloud()
-    pcd_full.points = o3d.utility.Vector3dVector(pts.astype(numpy.float64))
-
     scored = []
-    for cid in range(labels_flat.max() + 1):
-        idx = numpy.where(labels_flat == cid)[0]
+    for cid in range(labels.max() + 1):
+        idx = numpy.where(labels == cid)[0]
         if idx.size < 30:
-            print(f"[segment] cluster {cid} rejected: too small ({idx.size})")
             continue
 
-        c = pcd_full.select_by_index(idx)
+        c = pcd.select_by_index(idx)
         obb = c.get_oriented_bounding_box()
         ext = numpy.sort(numpy.asarray(obb.extent))
-        center = numpy.asarray(obb.center)
-
-        print(f"[segment] cluster {cid}: pts={idx.size}, ext={ext}, center={center}")
 
         maxd = float(ext[2])
         mind = float(ext[0])
         if not (cube_min <= maxd <= cube_max):
-            print(f"    rejected: size out of range ({maxd:.3f})")
             continue
 
         compact = mind / maxd if maxd > 0 else 0.0
         if compact < 0.4:
-            print(f"    rejected: not compact enough ({compact:.3f})")
             continue
 
         score = idx.size * compact
-        print(f"    accepted: compact={compact:.3f}, score={score:.1f}")
         scored.append((score, c))
 
-    print(f"[segment] scored cube-like clusters: {len(scored)}")
     if not scored:
         return [], "no cube-like clusters"
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = [c for _, c in scored[:max_cubes]]
-    print(f"[segment] returning {len(top)} clusters (max_cubes={max_cubes})")
-    return top, "ok"
+    return [c for _, c in scored[:max_cubes]], "ok"
 
 def camera_pose_from_cluster_pcd(cluster):
     obb = cluster.get_oriented_bounding_box()
     T = numpy.eye(4)
     T[:3, :3] = numpy.asarray(obb.R)
     T[:3, 3] = numpy.asarray(obb.center)
-    print(f"[pose] center={T[:3,3]}")
     return T
-
-# ---------- mask visualization ----------
-
-def cluster_binary_mask(image, cloud, labels_img):
-    """
-    Create a visible 2D mask by using the cloud's pixel layout directly.
-    labels_img is HxW, aligned with cloud/image.
-    """
-    if cloud is None or labels_img is None:
-        return numpy.zeros_like(image)
-
-    H, W = cloud.shape[:2]
-    if labels_img.shape != (H, W):
-        print("[mask] labels_img shape mismatch, returning blank mask")
-        return numpy.zeros_like(image)
-
-    mask = numpy.zeros((H, W, 3), dtype=numpy.uint8)
-    mask[labels_img >= 0] = (255, 255, 255)
-    return mask
 
 # ---------- detector ----------
 
@@ -110,74 +101,49 @@ class CubePoseDetector:
 
     def set_camera_pose(self, T):
         self.t_cam_robot = T
-        print(f"[detector] set_camera_pose:\n{T}")
 
     def get_n_cubes(self, observation, max_cubes=3, cube_min=0.02, cube_max=0.06):
         image, cloud = observation
         if image is None or cloud is None:
-            print("[detector] image or cloud is None")
             return None, "no data", None, None
 
-        H, W = cloud.shape[:2]
         xyz = cloud[..., :3]
-        print(f"[detector] raw xyz shape: {xyz.shape}")
         xyz_m, _ = scale_xyz_to_meters_frame(xyz)
         finite = numpy.isfinite(xyz_m).all(axis=-1)
-        print(f"[detector] finite points: {finite.sum()} / {finite.size}")
         pts = xyz_m[finite]
 
         if pts.shape[0] < 100:
-            print(f"[detector] too few finite pts: {pts.shape[0]}")
             return None, "too few points", None, None
 
-        # DBSCAN on finite points (no voxel/outlier/plane to preserve mapping)
-        pcd_raw = o3d.geometry.PointCloud()
-        pcd_raw.points = o3d.utility.Vector3dVector(pts.astype(numpy.float64))
-        labels_flat = numpy.asarray(pcd_raw.cluster_dbscan(0.02, 25))
-        if labels_flat.size == 0 or labels_flat.max() < 0:
-            print("[detector] DBSCAN found no valid clusters")
-            labels_img = numpy.full((H, W), -1, dtype=int)
-            return None, "no clusters", pcd_raw, labels_img
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts.astype(numpy.float64))
 
-        # Build HxW label image aligned with cloud/image
-        labels_img = numpy.full((H * W,), -1, dtype=int)
-        labels_img[finite.flatten()] = labels_flat
-        labels_img = labels_img.reshape(H, W)
-
-        # Use Open3D again to score cube-like clusters
         clusters, msg = segment_top_n_cubes_open3d(
-            pts, labels_flat, max_cubes=max_cubes, cube_min=cube_min, cube_max=cube_max
+            pcd, max_cubes=max_cubes, cube_min=cube_min, cube_max=cube_max
         )
-        print(f"[detector] segment msg: {msg}")
         if not clusters:
-            return None, "no cubes", pcd_raw, labels_img
+            return None, msg, pcd, None
 
         T_rc = numpy.linalg.inv(self.t_cam_robot)
         out = []
-        for i, c in enumerate(clusters):
+        for c in clusters:
             T_cam = camera_pose_from_cluster_pcd(c)
             T_robot = T_rc @ T_cam
-            print(f"[detector] cube {i} robot xyz={T_robot[:3,3]}")
             out.append((T_robot, T_cam))
-        return out, "ok", pcd_raw, labels_img
 
-# ---------- stacking ----------
+        return out, "ok", pcd, None
+
+# ---------- stacking (unchanged) ----------
 
 def run_tower_sequence(arm, poses_robot):
     names = list(poses_robot.keys())
-    print(f"[stack] cube order (bottom->top): {names}")
 
-    # Hardcoded XY location for the FIRST cube (meters)
     X_STAGE = 230.1 / 1000.0
     Y_STAGE = -305.5 / 1000.0
 
-    # ---- 1. Move FIRST cube to fixed XY ----
     first = names[0]
-    print(f"[stack] moving base cube {first} to fixed XY")
-
     grasp_cube(arm, poses_robot[first])
 
-    # Copy pose and overwrite XY
     base = numpy.copy(poses_robot[first])
     base[0, 3] = X_STAGE
     base[1, 3] = Y_STAGE
@@ -185,46 +151,26 @@ def run_tower_sequence(arm, poses_robot):
     place_cube(arm, base)
     arm.stop_lite6_gripper()
 
-    print(f"[stack] base cube placed at XY=({X_STAGE:.3f}, {Y_STAGE:.3f}), z={base[2,3]:.3f}")
-
-    # ---- 2. Stack remaining cubes on top ----
     for k, name in enumerate(names[1:], start=1):
-        print(f"[stack] placing {name} at level {k}")
-
         grasp_cube(arm, poses_robot[name])
-
         T = numpy.copy(base)
-        T[2, 3] += k * STACK_HEIGHT   # increase height only
-
-        print(f"[stack] placing at z={T[2,3]:.3f}")
+        T[2, 3] += k * STACK_HEIGHT
         place_cube(arm, T)
         arm.stop_lite6_gripper()
 
-    print("[stack] tower complete")
-
-# ---------- preview (axes + mask + k) ----------
+# ---------- preview (mask + axes + k) ----------
 
 def preview_n_cubes(image, cloud, K, detector, max_cubes, cube_min, cube_max):
-    print("[preview] starting preview")
-    if image is None or cloud is None:
-        blank = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
-        return {}, blank, False
-
     T = get_transform_camera_robot(image, K)
     detector.set_camera_pose(T)
 
-    results, msg, pcd_filt, labels_img = detector.get_n_cubes(
+    results, msg, pcd_filt, _ = detector.get_n_cubes(
         (image, cloud), max_cubes=max_cubes, cube_min=cube_min, cube_max=cube_max
     )
 
-    # --- SHOW MASK (blocking so you can inspect it) ---
-    if labels_img is not None:
-        mask = cluster_binary_mask(image, cloud, labels_img)
-    else:
-        mask = numpy.zeros_like(image)
-
+    # --- FAST MASK ---
+    mask = simple_depth_mask(cloud)
     cv2.imshow("cluster_mask", mask)
-    print("[debug] Showing cluster mask — press any key to continue")
     cv2.waitKey(0)
     cv2.destroyWindow("cluster_mask")
 
