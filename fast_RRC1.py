@@ -33,16 +33,8 @@ def segment_top_n_cubes_open3d(pcd, max_cubes=3, cube_min=0.02, cube_max=0.06):
     if len(inliers) > 0.1 * len(pcd.points):
         pcd = pcd.select_by_index(inliers, invert=True)
         print(f"[segment] after plane removal: {len(pcd.points)}")
-    
-    # Keep track of original pixel indices
-    xyz = numpy.asarray(pcd.points)
 
     labels = numpy.asarray(pcd.cluster_dbscan(0.02, 25))
-    labels_flat = numpy.asarray(pcd.cluster_dbscan(0.02, 25))
-    labels_img = numpy.full((H*W,), -1, dtype=int)
-    labels_img[finite.flatten()] = labels_flat
-    labels_img = labels_img.reshape(H, W)
-
     if labels.size == 0:
         print("[segment] DBSCAN labels empty")
         return [], "no clusters", pcd, labels
@@ -100,29 +92,21 @@ def camera_pose_from_cluster_pcd(cluster):
 
 # ---------- mask visualization ----------
 
-def cluster_binary_mask(image, cloud, labels):
+def cluster_binary_mask(image, cloud, labels_img):
     """
     Create a visible 2D mask by using the cloud's pixel layout directly.
-    No projection math. Works because ZED point cloud is aligned with the image.
+    Assumes labels_img is HxW, aligned with cloud/image.
     """
-    if cloud is None or labels is None:
+    if cloud is None or labels_img is None:
         return numpy.zeros_like(image)
 
     H, W = cloud.shape[:2]
+    if labels_img.shape != (H, W):
+        return numpy.zeros_like(image)
+
     mask = numpy.zeros((H, W, 3), dtype=numpy.uint8)
-
-    # labels is 1D (N points). We reshape it back to image layout.
-    if labels.size == H * W:
-        lbl_img = labels.reshape(H, W)
-    else:
-        # fallback: no mask
-        return mask
-
-    # white where cluster label >= 0
-    mask[lbl_img >= 0] = (255, 255, 255)
-
+    mask[labels_img >= 0] = (255, 255, 255)
     return mask
-
 
 # ---------- detector ----------
 
@@ -155,12 +139,18 @@ class CubePoseDetector:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts.astype(numpy.float64))
 
-        clusters, msg, pcd_filt, labels = segment_top_n_cubes_open3d(
+        clusters, msg, pcd_filt, labels_1d = segment_top_n_cubes_open3d(
             pcd, max_cubes=max_cubes, cube_min=cube_min, cube_max=cube_max
         )
         print(f"[detector] segment msg: {msg}")
         if not clusters:
-            return None, "no cubes", pcd_filt, labels
+            return None, "no cubes", pcd_filt, None
+
+        # Build HxW label image aligned with cloud/image
+        H, W = cloud.shape[:2]
+        labels_img = numpy.full((H * W,), -1, dtype=int)
+        labels_img[finite.flatten()] = labels_1d
+        labels_img = labels_img.reshape(H, W)
 
         T_rc = numpy.linalg.inv(self.t_cam_robot)
         out = []
@@ -169,7 +159,7 @@ class CubePoseDetector:
             T_robot = T_rc @ T_cam
             print(f"[detector] cube {i} robot xyz={T_robot[:3,3]}")
             out.append((T_robot, T_cam))
-        return out, "ok", pcd_filt, labels
+        return out, "ok", pcd_filt, labels_img
 
 # ---------- stacking ----------
 
@@ -223,17 +213,21 @@ def preview_n_cubes(image, cloud, K, detector, max_cubes, cube_min, cube_max):
     T = get_transform_camera_robot(image, K)
     detector.set_camera_pose(T)
 
-    results, msg, pcd_filt, labels = detector.get_n_cubes(
+    results, msg, pcd_filt, labels_img = detector.get_n_cubes(
         (image, cloud), max_cubes=max_cubes, cube_min=cube_min, cube_max=cube_max
     )
 
-    # --- SHOW MASK ---
-    mask = cluster_binary_mask(image, pcd_filt if pcd_filt is not None else o3d.geometry.PointCloud(),
-                               labels if labels is not None else numpy.array([]), K)
+    # --- SHOW MASK (blocking so you can inspect it) ---
+    if labels_img is not None:
+        mask = cluster_binary_mask(image, cloud, labels_img)
+    else:
+        mask = numpy.zeros_like(image)
+
     cv2.imshow("cluster_mask", mask)
-    cv2.waitKey(0)   # <-- WAIT HERE so you can actually see it
+    print("[debug] Showing cluster mask — press any key to continue")
+    cv2.waitKey(0)
     cv2.destroyWindow("cluster_mask")
-    
+
     disp = image.copy()
 
     if results is None:
