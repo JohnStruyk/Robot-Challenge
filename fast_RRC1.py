@@ -209,7 +209,7 @@ def preview_n_cubes(image, cloud, K, detector, max_cubes, cube_min, cube_max):
 # ---------- main ----------
 
 def main():
-    NUM_CUBES = 6
+    NUM_CUBES = 14
     CUBE_MIN = 0.02
     CUBE_MAX = 0.06
 
