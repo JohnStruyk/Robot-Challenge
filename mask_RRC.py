@@ -39,6 +39,7 @@ TOOL_PITCH_DEG = 0.0
 ARM_SPEED_FAST = 3000
 ARM_SPEED_PLACE = 140
 GRIPPER_SETTLE_S = 0.30
+DBSCAN_EPS_CANDIDATES_M = (0.016, 0.018, 0.021, 0.024)
 
 
 def get_camera_to_robot_transform():
@@ -130,10 +131,15 @@ def isolate_cube_clusters(masked_points_m):
     if len(pcd_np.points) < 120:
         return [], plane_n, "no objects above table"
 
-    labels = numpy.asarray(
-        pcd_np.cluster_dbscan(eps=DBSCAN_EPS_M, min_points=DBSCAN_MIN_PTS, print_progress=False)
-    )
-    if labels.size == 0 or labels.max() < 0:
+    labels = None
+    for eps in DBSCAN_EPS_CANDIDATES_M:
+        candidate = numpy.asarray(
+            pcd_np.cluster_dbscan(eps=eps, min_points=DBSCAN_MIN_PTS, print_progress=False)
+        )
+        if candidate.size > 0 and candidate.max() >= 0:
+            labels = candidate
+            break
+    if labels is None:
         return [], plane_n, "dbscan found no clusters"
 
     scored = []
@@ -155,7 +161,18 @@ def isolate_cube_clusters(masked_points_m):
         scored.append((score, c))
 
     if not scored:
-        return [], plane_n, "no cube-like clusters"
+        # High-recall fallback: return largest clusters anyway.
+        raw = []
+        for cid in range(int(labels.max()) + 1):
+            idx = numpy.where(labels == cid)[0]
+            if idx.size < 25:
+                continue
+            c = pcd_np.select_by_index(idx)
+            raw.append((idx.size, c))
+        if not raw:
+            return [], plane_n, "no cube-like clusters"
+        raw.sort(key=lambda x: x[0], reverse=True)
+        return [c for _, c in raw[:MAX_CUBES]], plane_n, "fallback-largest-clusters"
     scored.sort(key=lambda x: x[0], reverse=True)
     return [c for _, c in scored[:MAX_CUBES]], plane_n, "ok"
 
@@ -223,8 +240,13 @@ class MaskCubeDetector:
         finite = numpy.isfinite(xyz).all(axis=-1)
         keep = valid & finite
         pts = xyz[keep]
+        used_fallback_all_points = False
         if pts.shape[0] < 200:
-            return [], mask, "too few valid masked points"
+            # If mask is too strict in this scene, fall back to all finite points.
+            pts = xyz[finite]
+            used_fallback_all_points = True
+            if pts.shape[0] < 200:
+                return [], mask, "too few valid points"
 
         # Convert to meters if needed.
         max_abs = float(numpy.nanmax(numpy.abs(pts)))
@@ -232,6 +254,16 @@ class MaskCubeDetector:
         pts_m = (pts * scale).astype(numpy.float64)
 
         clusters, plane_n, msg = isolate_cube_clusters(pts_m)
+        if (not clusters) and (not used_fallback_all_points):
+            # Second-chance pass on all finite points to maximize recall.
+            pts_all = xyz[finite]
+            max_abs_all = float(numpy.nanmax(numpy.abs(pts_all)))
+            scale_all = 0.001 if max_abs_all > 50.0 else 1.0
+            pts_all_m = (pts_all * scale_all).astype(numpy.float64)
+            clusters, plane_n, msg2 = isolate_cube_clusters(pts_all_m)
+            if clusters:
+                used_fallback_all_points = True
+                msg = f"{msg2}; fallback=all-finite"
         if not clusters:
             return [], mask, msg
 
@@ -248,7 +280,8 @@ class MaskCubeDetector:
                     "source": "mask-geometry",
                 }
             )
-        return out, mask, "ok"
+        suffix = "; fallback=all-finite" if used_fallback_all_points else ""
+        return out, mask, f"ok{suffix}"
 
 
 def make_stack_pose(base_pose, stack_index):
