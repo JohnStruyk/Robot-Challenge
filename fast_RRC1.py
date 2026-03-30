@@ -11,10 +11,12 @@ from xarm.wrapper import XArmAPI
 
 from utils.zed_camera import ZedCamera
 
+from checkpoint1 import robot_ip
+
 
 ################################################################### Constants
 
-robot_ip = ""
+
 
 GRIPPER_LENGTH = 0.067 * 1000.0
 
