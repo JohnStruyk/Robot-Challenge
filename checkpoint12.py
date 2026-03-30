@@ -213,7 +213,7 @@ def run_pure_vision_perception(cv_image, point_cloud, camera_intrinsic):
         (cv_image, point_cloud), camera_intrinsic, t_cam_robot
     )
 
-    (t_robot_cube, t_cam_cube) = cube_transforms[0]
+    t_robot_cube, t_cam_cube = cube_transforms[0]
 
     lines = [
         "LALALALALA"
@@ -225,7 +225,7 @@ def run_pure_vision_perception(cv_image, point_cloud, camera_intrinsic):
         if t_cam_cube is not None and numpy.isfinite(t_cam_cube).all():
             draw_pose_axes(disp, camera_intrinsic, t_cam_cube)
     disp = draw_status_overlay(disp, lines, (0, 220, 0))
-    return t_robot_cube, t_cam_cube, disp
+    return cube_transforms, disp
 
 
 def main():
@@ -244,9 +244,12 @@ def main():
     try:
         cv_image = zed.image
         point_cloud = zed.point_cloud
-        t_robot_cube, _t_cam_cube, disp = run_pure_vision_perception(
+
+        cube_transforms, disp = run_pure_vision_perception(
             cv_image, point_cloud, camera_intrinsic
         )
+
+        t_robot_cube, _t_cam_cube = cube_transforms[0]
 
         cv2.namedWindow("Verifying Cube Pose", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Verifying Cube Pose", 1280, 720)
