@@ -33,8 +33,16 @@ def segment_top_n_cubes_open3d(pcd, max_cubes=3, cube_min=0.02, cube_max=0.06):
     if len(inliers) > 0.1 * len(pcd.points):
         pcd = pcd.select_by_index(inliers, invert=True)
         print(f"[segment] after plane removal: {len(pcd.points)}")
+    
+    # Keep track of original pixel indices
+    xyz = numpy.asarray(pcd.points)
 
     labels = numpy.asarray(pcd.cluster_dbscan(0.02, 25))
+    labels_flat = numpy.asarray(pcd.cluster_dbscan(0.02, 25))
+    labels_img = numpy.full((H*W,), -1, dtype=int)
+    labels_img[finite.flatten()] = labels_flat
+    labels_img = labels_img.reshape(H, W)
+
     if labels.size == 0:
         print("[segment] DBSCAN labels empty")
         return [], "no clusters", pcd, labels
@@ -92,29 +100,29 @@ def camera_pose_from_cluster_pcd(cluster):
 
 # ---------- mask visualization ----------
 
-def cluster_binary_mask(image, pcd, labels, K):
-    mask = numpy.zeros((image.shape[0], image.shape[1], 3), dtype=numpy.uint8)
-    if labels is None or labels.size == 0 or len(pcd.points) == 0:
+def cluster_binary_mask(image, cloud, labels):
+    """
+    Create a visible 2D mask by using the cloud's pixel layout directly.
+    No projection math. Works because ZED point cloud is aligned with the image.
+    """
+    if cloud is None or labels is None:
+        return numpy.zeros_like(image)
+
+    H, W = cloud.shape[:2]
+    mask = numpy.zeros((H, W, 3), dtype=numpy.uint8)
+
+    # labels is 1D (N points). We reshape it back to image layout.
+    if labels.size == H * W:
+        lbl_img = labels.reshape(H, W)
+    else:
+        # fallback: no mask
         return mask
 
-    xyz = numpy.asarray(pcd.points)
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
+    # white where cluster label >= 0
+    mask[lbl_img >= 0] = (255, 255, 255)
 
-    z = xyz[:, 2]
-    valid = z > 1e-6
-    pts = xyz[valid]
-    if pts.shape[0] == 0:
-        return mask
-
-    u = (pts[:, 0] * fx / pts[:, 2] + cx).astype(int)
-    v = (pts[:, 1] * fy / pts[:, 2] + cy).astype(int)
-
-    ok = (u >= 0) & (u < mask.shape[1]) & (v >= 0) & (v < mask.shape[0])
-    u, v = u[ok], v[ok]
-
-    mask[v, u] = (255, 255, 255)
     return mask
+
 
 # ---------- detector ----------
 
@@ -223,8 +231,9 @@ def preview_n_cubes(image, cloud, K, detector, max_cubes, cube_min, cube_max):
     mask = cluster_binary_mask(image, pcd_filt if pcd_filt is not None else o3d.geometry.PointCloud(),
                                labels if labels is not None else numpy.array([]), K)
     cv2.imshow("cluster_mask", mask)
-    cv2.waitKey(1)
-
+    cv2.waitKey(0)   # <-- WAIT HERE so you can actually see it
+    cv2.destroyWindow("cluster_mask")
+    
     disp = image.copy()
 
     if results is None:
