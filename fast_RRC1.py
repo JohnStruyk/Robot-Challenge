@@ -17,41 +17,33 @@ def scale_xyz_to_meters_frame(xyz):
     print(f"[scale_xyz] max abs={m:.3f}, scale={s}")
     return xyz * s, s
 
-def segment_top_n_cubes_open3d(pcd, max_cubes=3, cube_min=0.02, cube_max=0.06):
-    print(f"[segment] input points: {len(pcd.points)}")
-    pcd = pcd.voxel_down_sample(0.003)
-    print(f"[segment] after voxel: {len(pcd.points)}")
-    pcd, _ = pcd.remove_statistical_outlier(25, 2.0)
-    print(f"[segment] after outlier: {len(pcd.points)}")
+def segment_top_n_cubes_open3d(pts, labels_flat, max_cubes=3, cube_min=0.02, cube_max=0.06):
+    """
+    pts: (N,3) finite 3D points in meters
+    labels_flat: (N,) cluster labels from DBSCAN on pts
+    """
+    print(f"[segment] input finite points: {pts.shape[0]}")
 
-    if len(pcd.points) == 0:
-        print("[segment] no points after filtering")
-        return [], "empty", pcd, numpy.array([])
+    if pts.shape[0] == 0 or labels_flat.size == 0:
+        print("[segment] no points or labels")
+        return [], "empty"
 
-    plane, inliers = pcd.segment_plane(0.01, 3, 1500)
-    print(f"[segment] plane inliers: {len(inliers)} / {len(pcd.points)}")
-    if len(inliers) > 0.1 * len(pcd.points):
-        pcd = pcd.select_by_index(inliers, invert=True)
-        print(f"[segment] after plane removal: {len(pcd.points)}")
-
-    labels = numpy.asarray(pcd.cluster_dbscan(0.02, 25))
-    if labels.size == 0:
-        print("[segment] DBSCAN labels empty")
-        return [], "no clusters", pcd, labels
-    print(f"[segment] DBSCAN labels: min={labels.min()}, max={labels.max()}")
-
-    if labels.max() < 0:
+    if labels_flat.max() < 0:
         print("[segment] no valid cluster labels")
-        return [], "no clusters", pcd, labels
+        return [], "no clusters"
+
+    # Build a single point cloud for selecting clusters
+    pcd_full = o3d.geometry.PointCloud()
+    pcd_full.points = o3d.utility.Vector3dVector(pts.astype(numpy.float64))
 
     scored = []
-    for cid in range(labels.max() + 1):
-        idx = numpy.where(labels == cid)[0]
+    for cid in range(labels_flat.max() + 1):
+        idx = numpy.where(labels_flat == cid)[0]
         if idx.size < 30:
             print(f"[segment] cluster {cid} rejected: too small ({idx.size})")
             continue
 
-        c = pcd.select_by_index(idx)
+        c = pcd_full.select_by_index(idx)
         obb = c.get_oriented_bounding_box()
         ext = numpy.sort(numpy.asarray(obb.extent))
         center = numpy.asarray(obb.center)
@@ -75,12 +67,12 @@ def segment_top_n_cubes_open3d(pcd, max_cubes=3, cube_min=0.02, cube_max=0.06):
 
     print(f"[segment] scored cube-like clusters: {len(scored)}")
     if not scored:
-        return [], "no cube-like clusters", pcd, labels
+        return [], "no cube-like clusters"
 
     scored.sort(key=lambda x: x[0], reverse=True)
     top = [c for _, c in scored[:max_cubes]]
     print(f"[segment] returning {len(top)} clusters (max_cubes={max_cubes})")
-    return top, "ok", pcd, labels
+    return top, "ok"
 
 def camera_pose_from_cluster_pcd(cluster):
     obb = cluster.get_oriented_bounding_box()
@@ -95,13 +87,14 @@ def camera_pose_from_cluster_pcd(cluster):
 def cluster_binary_mask(image, cloud, labels_img):
     """
     Create a visible 2D mask by using the cloud's pixel layout directly.
-    Assumes labels_img is HxW, aligned with cloud/image.
+    labels_img is HxW, aligned with cloud/image.
     """
     if cloud is None or labels_img is None:
         return numpy.zeros_like(image)
 
     H, W = cloud.shape[:2]
     if labels_img.shape != (H, W):
+        print("[mask] labels_img shape mismatch, returning blank mask")
         return numpy.zeros_like(image)
 
     mask = numpy.zeros((H, W, 3), dtype=numpy.uint8)
@@ -125,6 +118,7 @@ class CubePoseDetector:
             print("[detector] image or cloud is None")
             return None, "no data", None, None
 
+        H, W = cloud.shape[:2]
         xyz = cloud[..., :3]
         print(f"[detector] raw xyz shape: {xyz.shape}")
         xyz_m, _ = scale_xyz_to_meters_frame(xyz)
@@ -136,21 +130,27 @@ class CubePoseDetector:
             print(f"[detector] too few finite pts: {pts.shape[0]}")
             return None, "too few points", None, None
 
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts.astype(numpy.float64))
+        # DBSCAN on finite points (no voxel/outlier/plane to preserve mapping)
+        pcd_raw = o3d.geometry.PointCloud()
+        pcd_raw.points = o3d.utility.Vector3dVector(pts.astype(numpy.float64))
+        labels_flat = numpy.asarray(pcd_raw.cluster_dbscan(0.02, 25))
+        if labels_flat.size == 0 or labels_flat.max() < 0:
+            print("[detector] DBSCAN found no valid clusters")
+            labels_img = numpy.full((H, W), -1, dtype=int)
+            return None, "no clusters", pcd_raw, labels_img
 
-        clusters, msg, pcd_filt, labels_1d = segment_top_n_cubes_open3d(
-            pcd, max_cubes=max_cubes, cube_min=cube_min, cube_max=cube_max
+        # Build HxW label image aligned with cloud/image
+        labels_img = numpy.full((H * W,), -1, dtype=int)
+        labels_img[finite.flatten()] = labels_flat
+        labels_img = labels_img.reshape(H, W)
+
+        # Use Open3D again to score cube-like clusters
+        clusters, msg = segment_top_n_cubes_open3d(
+            pts, labels_flat, max_cubes=max_cubes, cube_min=cube_min, cube_max=cube_max
         )
         print(f"[detector] segment msg: {msg}")
         if not clusters:
-            return None, "no cubes", pcd_filt, None
-
-        # Build HxW label image aligned with cloud/image
-        H, W = cloud.shape[:2]
-        labels_img = numpy.full((H * W,), -1, dtype=int)
-        labels_img[finite.flatten()] = labels_1d
-        labels_img = labels_img.reshape(H, W)
+            return None, "no cubes", pcd_raw, labels_img
 
         T_rc = numpy.linalg.inv(self.t_cam_robot)
         out = []
@@ -159,7 +159,7 @@ class CubePoseDetector:
             T_robot = T_rc @ T_cam
             print(f"[detector] cube {i} robot xyz={T_robot[:3,3]}")
             out.append((T_robot, T_cam))
-        return out, "ok", pcd_filt, labels_img
+        return out, "ok", pcd_raw, labels_img
 
 # ---------- stacking ----------
 
