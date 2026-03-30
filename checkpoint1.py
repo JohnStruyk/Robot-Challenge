@@ -16,7 +16,7 @@ robot_ip = '192.168.1.159'
 
 # Motion constants (meters / degrees)
 SAFE_Z = 0.22
-GRASP_Z_OFFSET = 0.01
+GRASP_Z_OFFSET = 0.003
 LIFT_Z_DELTA = 0.06
 PLACE_Z_OFFSET = 0.01
 
