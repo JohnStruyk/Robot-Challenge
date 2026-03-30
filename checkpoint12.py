@@ -21,7 +21,7 @@ def points_to_meters_open3d(xyz):
     return (xyz * scale).astype(numpy.float64), scale
 
 
-def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud):
+def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
     """
     Segment a tabletop cube: voxel downsample, outliers, RANSAC plane, DBSCAN,
     then pick the most cube-like cluster (with a size fallback).
@@ -67,34 +67,58 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud):
         qual = 1.0 if 0.25 < compact <= 1.0 else 0.3
         return float(idx.size) * compact * qual, cluster
 
-    best_cluster = None
-    best_score = -1.0
-    fallback_largest = None
-    fallback_n = 0
+    scored_clusters = []
+    fallback_clusters = []
 
     for cid in range(max_label + 1):
         idx = numpy.where(labels == cid)[0]
         if idx.size < 30:
             continue
+
         cluster = pcd.select_by_index(idx)
         sc, chosen = score_cluster(cluster, idx)
-        if idx.size > fallback_n:
-            fallback_n = idx.size
-            fallback_largest = cluster
-        if sc > best_score and chosen is not None:
-            best_score = sc
-            best_cluster = chosen
 
-    if best_cluster is not None:
-        return best_cluster, "cube-like cluster"
+        # keep track of all clusters for fallback
+        fallback_clusters.append((idx.size, cluster))
 
-    if fallback_largest is not None and len(fallback_largest.points) >= 40:
-        return fallback_largest, "fallback: largest cluster (tune thresholds)"
+        if chosen is not None:
+            scored_clusters.append((sc, chosen))
+
+    # sort by score descending
+    scored_clusters.sort(key=lambda x: x[0], reverse=True)
+
+    if len(scored_clusters) > 0:
+        top_clusters = [c for (_, c) in scored_clusters[:num_cubes]]
+        return top_clusters, f"{len(top_clusters)} cube-like clusters"
+
+    # fallback: largest clusters by size
+    fallback_clusters.sort(key=lambda x: x[0], reverse=True)
+
+    if len(fallback_clusters) > 0:
+        top_clusters = [c for (_, c) in fallback_clusters[:num_cubes] if len(c.points) >= 40]
+        if len(top_clusters) > 0:
+            return top_clusters, f"fallback: {len(top_clusters)} largest clusters"
 
     return None, "no cluster passed filters"
 
+def get_cube_transform(cube_pcd, camera_pose):
+    if cube_pcd is None or len(cube_pcd.points) < 30:
+        return None
 
-def get_transform_cube(observation, camera_intrinsic, camera_pose):
+    obb = cube_pcd.get_oriented_bounding_box()
+    center = numpy.asarray(obb.center)
+    R_cam_cube = numpy.asarray(obb.R)
+
+    t_cam_cube = numpy.eye(4)
+    t_cam_cube[:3, :3] = R_cam_cube
+    t_cam_cube[:3, 3] = center
+
+    t_robot_cam = numpy.linalg.inv(camera_pose)
+    t_robot_cube = t_robot_cam @ t_cam_cube
+
+    return (t_robot_cube, t_cam_cube)
+
+def get_cube_transforms(observation, camera_intrinsic, camera_pose):
     """
     Estimate cube pose from image + point cloud (geometry; image for API only).
 
@@ -120,22 +144,14 @@ def get_transform_cube(observation, camera_intrinsic, camera_pose):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(valid_points_m)
 
-    cube_pcd, seg_msg = isolate_cube_cluster_open3d(pcd)
-    if cube_pcd is None or len(cube_pcd.points) < 30:
-        return None, seg_msg
+    cube_pcds, _ = isolate_cube_cluster_open3d(pcd, num_cubes=4)
 
-    obb = cube_pcd.get_oriented_bounding_box()
-    center = numpy.asarray(obb.center)
-    R_cam_cube = numpy.asarray(obb.R)
+    transforms = []
 
-    t_cam_cube = numpy.eye(4)
-    t_cam_cube[:3, :3] = R_cam_cube
-    t_cam_cube[:3, 3] = center
+    for pcd in cube_pcds:
+        transforms.append(get_cube_transform(pcd, camera_pose))
 
-    t_robot_cam = numpy.linalg.inv(camera_pose)
-    t_robot_cube = t_robot_cam @ t_cam_cube
-
-    return (t_robot_cube, t_cam_cube), seg_msg
+    return transforms
 
 
 def draw_status_overlay(image_bgra, lines, color=(0, 220, 0)):
@@ -192,37 +208,24 @@ def run_pure_vision_perception(cv_image, point_cloud, camera_intrinsic):
         )
         return None, None, disp, "calibration failed"
 
-    try:
-        result = get_transform_cube(
-            (cv_image, point_cloud), camera_intrinsic, t_cam_robot
-        )
-        if result is None or result[0] is None:
-            msg = result[1] if isinstance(result, tuple) and len(result) > 1 else "unknown"
-            disp = draw_status_overlay(
-                cv_image,
-                [f"Cube pose: {msg}"],
-                (0, 165, 255),
-            )
-            return None, None, disp, msg
 
-        (t_robot_cube, t_cam_cube), seg_msg = result
-        lines = [
-            f"Segmentation: {seg_msg}",
-            "OK - press k to run motion, any other key to quit",
-        ]
-        disp = cv_image.copy()
+    cube_transforms = get_cube_transforms(
+        (cv_image, point_cloud), camera_intrinsic, t_cam_robot
+    )
+
+    (t_robot_cube, t_cam_cube) = cube_transforms[0]
+
+    lines = [
+        "LALALALALA"
+    ]
+    disp = cv_image.copy()
+
+    for transform in cube_transforms:
+        t_cam_cube = transform[1]
         if t_cam_cube is not None and numpy.isfinite(t_cam_cube).all():
             draw_pose_axes(disp, camera_intrinsic, t_cam_cube)
-        disp = draw_status_overlay(disp, lines, (0, 220, 0))
-        return t_robot_cube, t_cam_cube, disp, seg_msg
-    except Exception as exc:
-        traceback.print_exc()
-        disp = draw_status_overlay(
-            cv_image,
-            [f"Exception: {exc!s}"],
-            (0, 0, 255),
-        )
-        return None, None, disp, str(exc)
+    disp = draw_status_overlay(disp, lines, (0, 220, 0))
+    return t_robot_cube, t_cam_cube, disp
 
 
 def main():
@@ -241,7 +244,7 @@ def main():
     try:
         cv_image = zed.image
         point_cloud = zed.point_cloud
-        t_robot_cube, _t_cam_cube, disp, _status = run_pure_vision_perception(
+        t_robot_cube, _t_cam_cube, disp = run_pure_vision_perception(
             cv_image, point_cloud, camera_intrinsic
         )
 
