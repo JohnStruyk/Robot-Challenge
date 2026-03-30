@@ -10,12 +10,10 @@ from scipy.spatial.transform import Rotation
 from xarm.wrapper import XArmAPI
 
 from utils.zed_camera import ZedCamera
-
 from checkpoint1 import robot_ip
 
 
 ################################################################### Constants
-
 
 
 GRIPPER_LENGTH = 0.067 * 1000.0
@@ -33,25 +31,8 @@ PLACE_Z_OFFSET = 0.002
 TOOL_ROLL_DEG = 180.0
 TOOL_PITCH_DEG = 0.0
 
-# Vertical clearance: safe Z = tower_top_z + N * ref_height (not a fixed 0.22 m).
-SAFE_CLEARANCE_CUBE_HEIGHTS = 1.5
-MIN_GRASP_ABOVE_CUBE_M = 0.038
-SAFE_Z_MIN_M = 0.10
-SAFE_Z_MAX_M = 0.36
-REF_CUBE_HEIGHT_M = max(CUBE_PHYSICAL_HEIGHT_M, STACK_HEIGHT_M)
-
-# Arm speeds (mm/s). Fast for travel/grasp/lift; slow only for final place.
-ARM_SPEED_FAST = 2200
-ARM_SPEED_PLACE = 180
-ARM_SPEED_LIFT = 2000
-
-# Short waits (s); place keeps slightly longer after opening gripper.
-GRIPPER_SETTLE_GRASP_S = 0.35
-GRIPPER_SETTLE_PLACE_S = 0.45
-
-# Multi-frame pose fusion for repeatable grasps.
-POSE_SAMPLES = 3
-POSE_SAMPLE_DT_S = 0.04
+# Fixed clearance plane (m) above table for horizontal travel.
+SAFE_Z = 0.22
 
 
 def get_transform_camera_robot(observation, camera_intrinsic):
@@ -64,7 +45,8 @@ def get_transform_camera_robot(observation, camera_intrinsic):
     return numpy.eye(4)
 
 
-#################################################################### Geometry 
+#################################################################### Geometry helpers
+
 
 def points_to_meters_open3d(xyz):
     """Scale point units to meters if values look like millimeters.
@@ -79,89 +61,23 @@ def points_to_meters_open3d(xyz):
     return (xyz * scale).astype(numpy.float64), scale
 
 
-def orthonormalize_rotation(R):
-    """Turn a 3x3 matrix into a proper rotation (fix small numeric errors).
-
-    Inputs: R — 3x3 matrix.
-    Outputs: 3x3 rotation matrix in SO(3).
-    """
-    U, _, Vt = numpy.linalg.svd(R)
-    Rn = U @ Vt
-    if numpy.linalg.det(Rn) < 0:
-        U[:, -1] *= -1.0
-        Rn = U @ Vt
-    return Rn
-
-
-def average_rotation_matrices(R_list):
-    """Average rotations on SO(3) using a unit quaternion mean (signs unified).
-
-    Averaging raw 3x3 matrices breaks orthogonality badly; this is the standard fix.
-
-    Inputs: R_list — list of 3x3 rotation matrices.
-    Outputs: one 3x3 rotation matrix, or None if R_list is empty.
-    """
-    if not R_list:
-        return None
-    if len(R_list) == 1:
-        return numpy.asarray(R_list[0], dtype=numpy.float64)
-    Rs = numpy.stack(
-        [orthonormalize_rotation(numpy.asarray(R, dtype=numpy.float64)) for R in R_list],
-        axis=0,
-    )
-    quats = Rotation.from_matrix(Rs).as_quat()
-    ref = quats[0].copy()
-    aligned = numpy.empty_like(quats)
-    aligned[0] = ref
-    for i in range(1, quats.shape[0]):
-        q = quats[i]
-        if numpy.dot(ref, q) < 0.0:
-            q = -q
-        aligned[i] = q
-    q_mean = numpy.mean(aligned, axis=0)
-    nrm = numpy.linalg.norm(q_mean)
-    if nrm < 1e-12:
-        return Rs[0]
-    q_mean /= nrm
-    return Rotation.from_quat(q_mean).as_matrix()
-
-
-def refine_pose_cam_from_cluster_pcd(cube_pcd: o3d.geometry.PointCloud):
-    """Blend robust centroid and OBB center; rotation from OBB projected to SO(3).
-
-    Inputs: cube_pcd — segmented cube point cloud in camera frame.
-    Outputs: (t_cam_cube_4x4, height_m) — pose and tallest box edge as height.
-    """
-    pts = numpy.asarray(cube_pcd.points)
-    # Coordinate-wise median resists depth outliers better than the mean.
-    centroid = numpy.median(pts, axis=0)
-    obb = cube_pcd.get_oriented_bounding_box()
-    c_obb = numpy.asarray(obb.center)
-    center = 0.62 * centroid + 0.38 * c_obb
-    R = orthonormalize_rotation(numpy.asarray(obb.R))
-    ext = numpy.sort(numpy.asarray(obb.extent))
-    height_m = float(ext[2])
-    t_cam = numpy.eye(4)
-    t_cam[:3, :3] = R
-    t_cam[:3, 3] = center
-    return t_cam, height_m
-
-
-def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud):
-    """Clean the cloud and pick the best blob that looks like a cube on the table.
+def segment_all_cubes_open3d(pcd: o3d.geometry.PointCloud):
+    """Segment the point cloud into multiple cube-like clusters on the table.
 
     Inputs: pcd — point cloud in meters.
-    Outputs: (cluster_pcd, message) on success, or (None, error string) on failure.
+    Outputs: (clusters, message) where clusters is a list of point clouds.
     """
     if len(pcd.points) < 150:
-        return None, "too few points after NaN filter"
+        return [], "too few points after NaN filter"
 
+    # Downsample and denoise
     pcd = pcd.voxel_down_sample(voxel_size=0.003)
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=25, std_ratio=2.0)
 
     if len(pcd.points) < 100:
-        return None, "too few points after voxel/outlier"
+        return [], "too few points after voxel/outlier"
 
+    # Remove dominant plane (table)
     plane_model, inliers = pcd.segment_plane(
         distance_threshold=0.010,
         ransac_n=3,
@@ -171,219 +87,145 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud):
         pcd = pcd.select_by_index(inliers, invert=True)
 
     if len(pcd.points) < 80:
-        return None, "nothing left after plane removal"
+        return [], "nothing left after plane removal"
 
+    # Cluster with DBSCAN
     labels = numpy.asarray(
         pcd.cluster_dbscan(eps=0.020, min_points=25, print_progress=False)
     )
     max_label = int(labels.max()) if labels.size else -1
     if max_label < 0:
-        return None, "DBSCAN found no clusters"
+        return [], "DBSCAN found no clusters"
+
+    clusters = []
 
     def score_cluster(cluster, idx):
         """Score one cluster by size and shape; higher is better cube-like."""
         obb = cluster.get_oriented_bounding_box()
         ext = numpy.sort(numpy.asarray(obb.extent))
         if ext[2] < 1e-9:
-            return -1.0, None
+            return -1.0
         max_dim = float(ext[2])
         min_dim = float(ext[0])
         compact = min_dim / max_dim if max_dim > 0 else 0.0
         size_ok = 0.008 <= max_dim <= 0.090
         if not size_ok:
-            return float(idx.size) * 0.01, None
+            return float(idx.size) * 0.01
         qual = 1.0 if 0.25 < compact <= 1.0 else 0.3
-        return float(idx.size) * compact * qual, cluster
-
-    best_cluster = None
-    best_score = -1.0
-    fallback_largest = None
-    fallback_n = 0
+        return float(idx.size) * compact * qual
 
     for cid in range(max_label + 1):
         idx = numpy.where(labels == cid)[0]
         if idx.size < 30:
             continue
         cluster = pcd.select_by_index(idx)
-        sc, chosen = score_cluster(cluster, idx)
-        if idx.size > fallback_n:
-            fallback_n = idx.size
-            fallback_largest = cluster
-        if sc > best_score and chosen is not None:
-            best_score = sc
-            best_cluster = chosen
+        sc = score_cluster(cluster, idx)
+        if sc <= 0.0:
+            continue
+        clusters.append(cluster)
 
-    if best_cluster is not None:
-        return best_cluster, "cube-like cluster"
+    if not clusters:
+        return [], "no cluster passed filters"
 
-    if fallback_largest is not None and len(fallback_largest.points) >= 40:
-        return fallback_largest, "fallback: largest cluster"
-
-    return None, "no cluster passed filters"
+    return clusters, f"{len(clusters)} cube-like clusters"
 
 
-def get_transform_cube_geometry(observation, camera_intrinsic, camera_pose):
-    """Get cube pose from the depth cloud using refined pose from the cube cluster.
+def cluster_to_pose(cluster: o3d.geometry.PointCloud):
+    """Convert a cube cluster to a pose and height in camera frame.
 
-    Inputs: observation — (image, point_cloud); camera_intrinsic — K; camera_pose — world-to-camera 4x4.
-    Outputs: ((robot_cube_4x4, cam_cube_4x4), status_msg, height_m), or (None, msg, None) if it fails.
+    Inputs: cluster — Open3D point cloud.
+    Outputs: (t_cam_cube_4x4, height_m).
+    """
+    obb = cluster.get_oriented_bounding_box()
+    center = numpy.asarray(obb.center)
+    R_cam_cube = numpy.asarray(obb.R)
+    ext = numpy.sort(numpy.asarray(obb.extent))
+    height_m = float(ext[2])
+
+    t_cam_cube = numpy.eye(4)
+    t_cam_cube[:3, :3] = R_cam_cube
+    t_cam_cube[:3, 3] = center
+
+    return t_cam_cube, height_m
+
+
+def detect_all_cubes_geometry(observation, camera_intrinsic, t_cam_robot):
+    """Detect all cube poses from the depth cloud using oriented boxes around clusters.
+
+    Inputs: observation — (image, point_cloud); camera_intrinsic — K; t_cam_robot — camera-to-robot 4x4.
+    Outputs: (list_of_results, status_msg) where each result is (t_robot_cube, t_cam_cube, height_m).
     """
     image, point_cloud = observation
     if image is None or point_cloud is None:
-        return None, "missing image or point_cloud", None
+        return [], "missing image or point_cloud"
 
     xyz = point_cloud[..., :3]
     valid_mask = numpy.isfinite(xyz).all(axis=-1)
     valid_points = xyz[valid_mask]
 
     if valid_points.shape[0] < 100:
-        return None, f"too few finite points: {valid_points.shape[0]}", None
+        return [], f"too few finite points: {valid_points.shape[0]}"
 
     valid_points_m, _ = points_to_meters_open3d(valid_points)
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(valid_points_m)
 
-    cube_pcd, seg_msg = isolate_cube_cluster_open3d(pcd)
-    if cube_pcd is None or len(cube_pcd.points) < 30:
-        return None, seg_msg, None
+    clusters, seg_msg = segment_all_cubes_open3d(pcd)
+    if not clusters:
+        return [], seg_msg
 
-    t_cam_cube, height_m = refine_pose_cam_from_cluster_pcd(cube_pcd)
+    results = []
+    for cluster in clusters:
+        t_cam_cube, height_m = cluster_to_pose(cluster)
+        # camera-to-robot transform: robot_T_cube = robot_T_cam * cam_T_cube
+        t_robot_cube = t_cam_robot @ t_cam_cube
+        results.append((t_robot_cube, t_cam_cube, height_m))
 
-    t_robot_cam = numpy.linalg.inv(camera_pose)
-    t_robot_cube = t_robot_cam @ t_cam_cube
-
-    return (t_robot_cube, t_cam_cube), seg_msg, height_m
+    return results, seg_msg
 
 
-def average_pose_matrices(mats):
-    """Merge several 4x4 poses: median translation, quaternion mean of rotations.
+def detect_all_cubes_unified(observation, camera_intrinsic, t_cam_robot):
+    """Unified multi-cube detection wrapper.
 
-    Inputs: mats — list of 4x4 numpy arrays.
-    Outputs: single 4x4 pose, or None if mats is empty.
+    Inputs: observation — (image, point_cloud); camera_intrinsic — K; t_cam_robot — camera-to-robot 4x4.
+    Outputs: (results, source_or_error) where results is a list of (t_robot, t_cam, h_m).
     """
-    if not mats:
+    results, msg = detect_all_cubes_geometry(observation, camera_intrinsic, t_cam_robot)
+    if not results:
+        return [], msg
+    return results, "geometry"
+
+
+def choose_next_cube(cube_results):
+    """Choose the next cube to pick based on proximity to robot origin in XY.
+
+    Inputs: cube_results — list of (t_robot_cube, t_cam_cube, height_m).
+    Outputs: (t_robot_cube, t_cam_cube, height_m) for the chosen cube.
+    """
+    if not cube_results:
         return None
-    T = numpy.stack(mats, axis=0)
-    pos = numpy.median(T[:, :3, 3], axis=0)
-    R_list = [T[i, :3, :3] for i in range(T.shape[0])]
-    Rm = average_rotation_matrices(R_list)
-    if Rm is None:
-        return None
-    out = numpy.eye(4)
-    out[:3, :3] = Rm
-    out[:3, 3] = pos
-    return out
 
+    def xy_dist_sq(t_robot_cube):
+        x, y, _ = t_robot_cube[:3, 3]
+        return x * x + y * y
 
-def detect_cube_pose_once(observation, camera_intrinsic, t_cam_robot):
-    """One geometry-only detection attempt (single frame).
-
-    Inputs: observation — (image, point_cloud); camera_intrinsic — K; t_cam_robot — camera-to-robot.
-    Outputs: (pose_robot, pose_cam, height_m, "geometry") or (None, None, None, error_text).
-    """
-    g = get_transform_cube_geometry(observation, camera_intrinsic, t_cam_robot)
-    if g[0] is None:
-        return None, None, None, g[1]
-    (t_r, t_c), _msg, h_m = g
-    return t_r, t_c, h_m, "geometry"
-
-
-def detect_cube_pose_unified(
-    observation,
-    camera_intrinsic,
-    t_cam_robot,
-    n_samples=None,
-    sample_dt_s=None,
-):
-    """Detect cube pose; optionally average several frames for a steadier pose.
-
-    Inputs: observation — (image, point_cloud); camera_intrinsic — K; t_cam_robot — camera-to-robot;
-            n_samples — frames to fuse (1 = no fusion);
-            sample_dt_s — sleep between frames when n_samples > 1.
-    Outputs: (pose_robot, pose_cam, height_m, source) or (None, None, None, error_text).
-    """
-    n_samples = POSE_SAMPLES if n_samples is None else n_samples
-    sample_dt_s = POSE_SAMPLE_DT_S if sample_dt_s is None else sample_dt_s
-
-    if n_samples <= 1:
-        r = detect_cube_pose_once(
-            observation, camera_intrinsic, t_cam_robot
-        )
-        if r[0] is None:
-            return None, None, None, r[3]
-        return r[0], r[1], r[2], r[3]
-
-    ok = []
-    last_err = "no samples"
-    for _ in range(n_samples):
-        r = detect_cube_pose_once(
-            observation, camera_intrinsic, t_cam_robot
-        )
-        if r[0] is not None:
-            ok.append(r)
-        else:
-            last_err = r[3]
-        time.sleep(sample_dt_s)
-
-    if not ok:
-        return None, None, None, last_err
-
-    trs = [x[0] for x in ok]
-    tcs = [x[1] for x in ok]
-    t_r = average_pose_matrices(trs)
-    t_c = average_pose_matrices(tcs)
-    h_m = float(numpy.median([x[2] for x in ok]))
-    src = ok[0][3]
-    return t_r, t_c, h_m, src
-
-
-def compute_safe_clearance_z_mm(tower_top_z_m, cube_center_z_m, cube_height_m):
-    """Safe tool height in mm so the arm clears the stack (not a fixed 0.22 m).
-
-    Inputs: tower_top_z_m — world z of top of stack; cube_center_z_m — cube center z;
-            cube_height_m — reference cube height for margin.
-    Outputs: safe z in millimeters for the arm (clamped).
-    """
-    ref_h = max(float(cube_height_m), REF_CUBE_HEIGHT_M)
-    clearance = SAFE_CLEARANCE_CUBE_HEIGHTS * ref_h
-    z_m = max(tower_top_z_m + clearance, float(cube_center_z_m) + MIN_GRASP_ABOVE_CUBE_M)
-    z_m = float(numpy.clip(z_m, SAFE_Z_MIN_M, SAFE_Z_MAX_M))
-    return z_m * 1000.0
+    best = min(cube_results, key=lambda r: xy_dist_sq(r[0]))
+    return best
 
 
 #################################################################### Manipulation
 
-def set_line(arm, x_mm, y_mm, z_mm, yaw_deg, speed):
-    """Move the arm to one Cartesian point with a set speed (helper).
 
-    Inputs: arm — xArm API; x_mm, y_mm, z_mm — position; yaw_deg — tool yaw; speed — mm/s.
-    Outputs: none (blocks until move finishes).
-    """
-    arm.set_position(
-        x_mm,
-        y_mm,
-        z_mm,
-        TOOL_ROLL_DEG,
-        TOOL_PITCH_DEG,
-        yaw_deg,
-        speed=speed,
-        is_radian=False,
-        wait=True,
-    )
+def grasp_cube(arm, cube_pose):
+    """Move to the cube, close the gripper, and lift up.
 
-
-def grasp_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
-    """Grasp with fast moves and adaptive safe height above the current stack top.
-
-    Inputs: arm — xArm API; cube_pose — 4x4 in robot frame; tower_top_z_m — stack top z (m);
-            cube_height_m — used for clearance margin.
+    Inputs: arm — xArm API; cube_pose — 4x4 pose of the cube in robot frame (meters).
     Outputs: none (moves the robot).
     """
     xyz = cube_pose[:3, 3]
     x_mm, y_mm, z_mm = (xyz * 1000.0).tolist()
-    z_c_m = float(xyz[2])
-    safe_z_mm = compute_safe_clearance_z_mm(tower_top_z_m, z_c_m, cube_height_m)
+    safe_z_mm = SAFE_Z * 1000.0
     grasp_z_mm = z_mm + (GRASP_Z_OFFSET * 1000.0)
     lift_z_mm = max(safe_z_mm, grasp_z_mm + (LIFT_Z_DELTA * 1000.0))
 
@@ -391,37 +233,89 @@ def grasp_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
     _, _, cube_yaw_deg = cube_r.as_euler("xyz", degrees=True)
 
     arm.open_lite6_gripper()
-    time.sleep(GRIPPER_SETTLE_GRASP_S)
+    time.sleep(1)
 
-    set_line(arm, x_mm, y_mm, safe_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
-    set_line(arm, x_mm, y_mm, grasp_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
+    arm.set_position(
+        x_mm,
+        y_mm,
+        safe_z_mm,
+        TOOL_ROLL_DEG,
+        TOOL_PITCH_DEG,
+        cube_yaw_deg,
+        is_radian=False,
+        wait=True,
+    )
+    arm.set_position(
+        x_mm,
+        y_mm,
+        grasp_z_mm,
+        TOOL_ROLL_DEG,
+        TOOL_PITCH_DEG,
+        cube_yaw_deg,
+        is_radian=False,
+        wait=True,
+    )
     arm.close_lite6_gripper()
-    time.sleep(GRIPPER_SETTLE_GRASP_S)
-    set_line(arm, x_mm, y_mm, lift_z_mm, cube_yaw_deg, ARM_SPEED_LIFT)
+    time.sleep(1)
+    arm.set_position(
+        x_mm,
+        y_mm,
+        lift_z_mm,
+        TOOL_ROLL_DEG,
+        TOOL_PITCH_DEG,
+        cube_yaw_deg,
+        is_radian=False,
+        wait=True,
+    )
 
 
-def place_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
-    """Place with fast travel, slower final down move, then fast lift away.
+def place_cube(arm, cube_pose):
+    """Move above the drop pose, place the cube, open gripper, and lift away.
 
-    Inputs: arm — xArm API; cube_pose — 4x4 target in robot frame; tower_top_z_m — stack top z;
-            cube_height_m — used for clearance margin.
+    Inputs: arm — xArm API; cube_pose — 4x4 target pose in robot frame (meters).
     Outputs: none (moves the robot).
     """
     xyz = cube_pose[:3, 3]
     x_mm, y_mm, z_mm = (xyz * 1000.0).tolist()
-    z_c_m = float(xyz[2])
-    safe_z_mm = compute_safe_clearance_z_mm(tower_top_z_m, z_c_m, cube_height_m)
+    safe_z_mm = SAFE_Z * 1000.0
     place_z_mm = z_mm + (PLACE_Z_OFFSET * 1000.0)
     lift_z_mm = max(safe_z_mm, place_z_mm + (LIFT_Z_DELTA * 1000.0))
 
     cube_r = Rotation.from_matrix(cube_pose[:3, :3])
     _, _, cube_yaw_deg = cube_r.as_euler("xyz", degrees=True)
 
-    set_line(arm, x_mm, y_mm, safe_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
-    set_line(arm, x_mm, y_mm, place_z_mm, cube_yaw_deg, ARM_SPEED_PLACE)
+    arm.set_position(
+        x_mm,
+        y_mm,
+        safe_z_mm,
+        TOOL_ROLL_DEG,
+        TOOL_PITCH_DEG,
+        cube_yaw_deg,
+        is_radian=False,
+        wait=True,
+    )
+    arm.set_position(
+        x_mm,
+        y_mm,
+        place_z_mm,
+        TOOL_ROLL_DEG,
+        TOOL_PITCH_DEG,
+        cube_yaw_deg,
+        is_radian=False,
+        wait=True,
+    )
     arm.open_lite6_gripper()
-    time.sleep(GRIPPER_SETTLE_PLACE_S)
-    set_line(arm, x_mm, y_mm, lift_z_mm, cube_yaw_deg, ARM_SPEED_LIFT)
+    time.sleep(1)
+    arm.set_position(
+        x_mm,
+        y_mm,
+        lift_z_mm,
+        TOOL_ROLL_DEG,
+        TOOL_PITCH_DEG,
+        cube_yaw_deg,
+        is_radian=False,
+        wait=True,
+    )
 
 
 def make_standard_tower_target_pose(base_pose, stack_index):
@@ -435,7 +329,8 @@ def make_standard_tower_target_pose(base_pose, stack_index):
     return t
 
 
-#################################################################### Visualization helpers 
+#################################################################### Visualization helpers
+
 
 def draw_pose_axes(image, camera_intrinsic, pose, size=0.1):
     """Draw RGB axes on the image for a pose in camera frame (for debugging).
@@ -486,7 +381,8 @@ def draw_status_overlay(image_bgra, lines, color=(0, 220, 0)):
     return out
 
 
-#################################################################### Challenge 1    
+#################################################################### Challenge 1 – multi-cube tower
+
 
 def run_challenge_standard_tower(
     arm,
@@ -496,13 +392,15 @@ def run_challenge_standard_tower(
     time_limit_s=60.0,
     dry_run_preview=True,
 ):
-    """Fast tower challenge: multi-sample detect, adaptive safe-Z, timed gripper.
+    """Run the tower challenge: pick cubes and stack them in a straight column.
 
     Inputs: arm — xArm API; zed — camera; max_cubes — cap; time_limit_s — seconds;
             dry_run_preview — if True, show one frame and wait for 'k'.
     Outputs: number of cubes placed (int).
     """
     camera_intrinsic = zed.camera_intrinsic
+
+    # Grab an initial frame
     cv_image = zed.image
     point_cloud = zed.point_cloud
 
@@ -515,17 +413,18 @@ def run_challenge_standard_tower(
             print("Calibration failed (arena tags).")
             return 0
         obs = (cv_image, point_cloud)
-        det = detect_cube_pose_unified(obs, camera_intrinsic, t_cam_robot)
-        if det[0] is None:
-            print("Preview detect failed:", det[3])
+        results, src = detect_all_cubes_unified(obs, camera_intrinsic, t_cam_robot)
+        if not results:
+            print("Preview detect failed:", src)
             return 0
-        t_r, t_c, _h, src = det
+
         disp = cv_image.copy()
-        draw_pose_axes(disp, camera_intrinsic, t_c)
+        for _t_r, t_c, _h in results:
+            draw_pose_axes(disp, camera_intrinsic, t_c)
         disp = draw_status_overlay(
             disp,
             [
-                f"RRC1 preview source={src}",
+                f"RRC1 preview source={src}, cubes={len(results)}",
                 "Press k to run tower, any other key to abort",
             ],
             (0, 220, 0),
@@ -541,46 +440,51 @@ def run_challenge_standard_tower(
     placed = 0
     start = time.time()
 
-    t_cam_robot = get_transform_camera_robot(zed.image, camera_intrinsic)
+    # Recompute transform and base pose from a fresh frame
+    cv_image = zed.image
+    point_cloud = zed.point_cloud
+    t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
     if t_cam_robot is None:
         print("Calibration failed.")
         return 0
 
-    base_det = detect_cube_pose_unified(
-        (zed.image, zed.point_cloud),
-        camera_intrinsic,
-        t_cam_robot,
-    )
-    if base_det[0] is None:
-        print("Could not get base pose:", base_det[3])
+    base_obs = (cv_image, point_cloud)
+    base_results, src = detect_all_cubes_unified(base_obs, camera_intrinsic, t_cam_robot)
+    if not base_results:
+        print("Could not get base pose:", src)
         return 0
-    t_base, _, _, _src = base_det
-    # Top face z of the reference cube at the tower location (before stacking).
-    tower_top_z_m = float(t_base[2, 3]) + 0.5 * STACK_HEIGHT_M
+
+    # Choose base cube (e.g., nearest to robot)
+    base_robot_pose, _base_cam_pose, _base_h = choose_next_cube(base_results)
+    t_base = base_robot_pose
 
     for idx in range(max_cubes):
         if time.time() - start > time_limit_s:
             break
 
-        det = detect_cube_pose_unified(
-            (zed.image, zed.point_cloud),
-            camera_intrinsic,
-            t_cam_robot,
-        )
-        if det[0] is None:
-            print("Detect failed:", det[3])
+        # Refresh camera data each iteration (assuming ZedCamera updates internally)
+        cv_image = zed.image
+        point_cloud = zed.point_cloud
+        obs = (cv_image, point_cloud)
+
+        results, src = detect_all_cubes_unified(obs, camera_intrinsic, t_cam_robot)
+        if not results:
+            print("Detect failed:", src)
             break
 
-        t_src, _, h_m, _src = det
-        h_grasp = max(float(h_m), REF_CUBE_HEIGHT_M)
+        chosen = choose_next_cube(results)
+        if chosen is None:
+            print("No suitable cube found.")
+            break
+
+        t_src, _t_cam_src, _h = chosen
         t_tgt = make_standard_tower_target_pose(t_base, idx)
 
         try:
-            grasp_cube(arm, t_src, tower_top_z_m, h_grasp)
-            place_cube(arm, t_tgt, tower_top_z_m, STACK_HEIGHT_M)
+            grasp_cube(arm, t_src)
+            place_cube(arm, t_tgt)
             arm.stop_lite6_gripper()
             placed += 1
-            tower_top_z_m = float(t_tgt[2, 3]) + 0.5 * STACK_HEIGHT_M
         except Exception as exc:
             traceback.print_exc()
             print("Motion error:", exc)
