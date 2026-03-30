@@ -14,7 +14,7 @@ from checkpoint1 import robot_ip
 
 
 ################################################################### Constants
-
+NUM_CUBE = 9
 
 GRIPPER_LENGTH = 0.067 * 1000.0
 
@@ -129,6 +129,52 @@ def segment_all_cubes_open3d(pcd: o3d.geometry.PointCloud):
 
     return clusters, f"{len(clusters)} cube-like clusters"
 
+def segment_top_n_cubes_open3d(pcd: o3d.geometry.PointCloud, max_cubes=1):
+    """
+    Return the top-N cube-like clusters based on the same scoring used in
+    segment_all_cubes_open3d.
+
+    Inputs:
+        pcd        — Open3D point cloud (meters)
+        max_cubes  — number of clusters to return
+
+    Outputs:
+        (clusters, message)
+    """
+    clusters, msg = segment_all_cubes_open3d(pcd)
+    if not clusters:
+        return [], msg
+
+    # Score clusters using the same scoring logic
+    scored = []
+    for cluster in clusters:
+        obb = cluster.get_oriented_bounding_box()
+        ext = numpy.sort(numpy.asarray(obb.extent))
+        if ext[2] < 1e-9:
+            continue
+        max_dim = float(ext[2])
+        min_dim = float(ext[0])
+        compact = min_dim / max_dim if max_dim > 0 else 0.0
+        size_ok = 0.008 <= max_dim <= 0.090
+        if not size_ok:
+            score = float(len(cluster.points)) * 0.01
+        else:
+            qual = 1.0 if 0.25 < compact <= 1.0 else 0.3
+            score = float(len(cluster.points)) * compact * qual
+
+        scored.append((score, cluster))
+
+    if not scored:
+        return [], "no cluster passed scoring"
+
+    # Sort by score descending
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Return top N clusters
+    top_clusters = [c for (_, c) in scored[:max_cubes]]
+    return top_clusters, f"returned {len(top_clusters)} clusters"
+
+
 
 def cluster_to_pose(cluster: o3d.geometry.PointCloud):
     """Convert a cube cluster to a pose and height in camera frame.
@@ -171,7 +217,7 @@ def detect_all_cubes_geometry(observation, camera_intrinsic, t_cam_robot):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(valid_points_m)
 
-    clusters, seg_msg = segment_all_cubes_open3d(pcd)
+    clusters, seg_msg = segment_top_n_cubes_open3d(pcd, max_cubes= NUM_CUBES)
     if not clusters:
         return [], seg_msg
 
@@ -215,7 +261,6 @@ def choose_next_cube(cube_results):
 
 
 #################################################################### Manipulation
-
 
 def grasp_cube(arm, cube_pose):
     """Move to the cube, close the gripper, and lift up.
