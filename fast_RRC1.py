@@ -79,7 +79,12 @@ def camera_pose_from_cluster_pcd(cluster):
     return T
 
 def visualize_clusters_on_image(image, pcd, labels, K):
-    disp = image.copy()
+    # Ensure 3-channel BGR
+    if image.shape[2] == 4:
+        disp = image[:, :, :3].copy()
+    else:
+        disp = image.copy()
+
     xyz = numpy.asarray(pcd.points)
     if labels.size == 0 or xyz.shape[0] == 0:
         return disp
@@ -94,21 +99,24 @@ def visualize_clusters_on_image(image, pcd, labels, K):
         idx = numpy.where(labels == cid)[0]
         if idx.size == 0:
             continue
+
         pts = xyz[idx]
         z = pts[:, 2]
-        valid_z = z > 1e-6
-        pts = pts[valid_z]
+        valid = z > 1e-6
+        pts = pts[valid]
         if pts.shape[0] == 0:
             continue
 
         u = (pts[:, 0] * fx / pts[:, 2] + cx).astype(int)
         v = (pts[:, 1] * fy / pts[:, 2] + cy).astype(int)
 
-        valid = (u >= 0) & (u < disp.shape[1]) & (v >= 0) & (v < disp.shape[0])
-        u, v = u[valid], v[valid]
+        ok = (u >= 0) & (u < disp.shape[1]) & (v >= 0) & (v < disp.shape[0])
+        u, v = u[ok], v[ok]
+
         disp[v, u] = colors[cid]
 
     return disp
+
 
 # --- detector ---
 
