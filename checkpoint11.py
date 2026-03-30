@@ -56,7 +56,7 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud):
     def score_cluster(cluster, idx):
         obb = cluster.get_oriented_bounding_box()
         ext = numpy.sort(numpy.asarray(obb.extent))
-        if ext[2] < 1e-9:
+        if ext[2] < 0.01 or ext[2] > 0.05:
             return -1.0, None
         max_dim = float(ext[2])
         min_dim = float(ext[0])
