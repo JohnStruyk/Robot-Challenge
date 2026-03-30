@@ -6,7 +6,6 @@ import traceback
 import cv2
 import numpy
 import open3d as o3d
-from pupil_apriltags import Detector
 from scipy.spatial.transform import Rotation
 from xarm.wrapper import XArmAPI
 
@@ -19,19 +18,6 @@ robot_ip = ""
 
 GRIPPER_LENGTH = 0.067 * 1000.0
 
-#################################################################### Arena AprilTags
-TAG_SIZE = 0.08
-TAG_CENTER_COORDINATES = [
-    [0.38, 0.4],
-    [0.38, -0.4],
-    [0.0, 0.4],
-    [0.0, -0.4],
-]
-
-#################################################################### Cube AprilTag
-CUBE_TAG_FAMILY = "tag36h11"
-CUBE_TAG_ID = 4
-CUBE_TAG_SIZE = 0.0207
 ####################################################################### Nominal physical height
 CUBE_PHYSICAL_HEIGHT_M = 0.03
 
@@ -66,78 +52,14 @@ POSE_SAMPLES = 3
 POSE_SAMPLE_DT_S = 0.04
 
 
-#################################################################### Calibration
-
-def get_pnp_pairs(tags):
-    """Build 3D arena points and 2D image points for AprilTags 0–3 for PnP.
-
-    Inputs: tags — list of detected AprilTag objects from the image.
-    Outputs: (world_points, image_points) — two numpy arrays for cv2.solvePnP.
-    """
-    world_points = numpy.empty([0, 3])
-    image_points = numpy.empty([0, 2])
-
-    for tag in tags:
-        if tag.tag_id > 3:
-            continue
-
-        tag_center = TAG_CENTER_COORDINATES[tag.tag_id]
-
-        wp = numpy.zeros(3)
-        wp[0] = tag_center[0] - (TAG_SIZE / 2)
-        wp[1] = tag_center[1] + (TAG_SIZE / 2)
-        ip = tag.corners[0]
-        world_points = numpy.vstack([world_points, wp])
-        image_points = numpy.vstack([image_points, ip])
-
-        wp = numpy.zeros(3)
-        wp[0] = tag_center[0] - (TAG_SIZE / 2)
-        wp[1] = tag_center[1] - (TAG_SIZE / 2)
-        ip = tag.corners[1]
-        world_points = numpy.vstack([world_points, wp])
-        image_points = numpy.vstack([image_points, ip])
-
-        wp = numpy.zeros(3)
-        wp[0] = tag_center[0] + (TAG_SIZE / 2)
-        wp[1] = tag_center[1] - (TAG_SIZE / 2)
-        ip = tag.corners[2]
-        world_points = numpy.vstack([world_points, wp])
-        image_points = numpy.vstack([image_points, ip])
-
-        wp = numpy.zeros(3)
-        wp[0] = tag_center[0] + (TAG_SIZE / 2)
-        wp[1] = tag_center[1] + (TAG_SIZE / 2)
-        ip = tag.corners[3]
-        world_points = numpy.vstack([world_points, wp])
-        image_points = numpy.vstack([image_points, ip])
-
-    return world_points, image_points
-
-
 def get_transform_camera_robot(observation, camera_intrinsic):
-    """Find the camera pose in the arena frame using the four big floor tags.
+    """Return a default camera->robot transform when external markers are unavailable.
 
-    Inputs: observation — camera image (BGRA or gray); camera_intrinsic — 3x3 K matrix.
-    Outputs: 4x4 transform (world/arena to camera), or None if PnP fails.
+    Inputs: observation — camera image (unused); camera_intrinsic — intrinsics (unused).
+    Outputs: identity 4x4 transform.
     """
-    detector = Detector(families="tag36h11")
-    if len(observation.shape) > 2:
-        observation = cv2.cvtColor(observation, cv2.COLOR_BGRA2GRAY)
-    tags = detector.detect(observation, estimate_tag_pose=False)
-    world_points, image_points = get_pnp_pairs(tags)
-    if world_points.shape[0] < 4:
-        return None
-
-    success, rotation_vec, translation = cv2.solvePnP(
-        world_points, image_points, camera_intrinsic, None
-    )
-    if success is not True:
-        return None
-    rotation_mat, _ = cv2.Rodrigues(rotation_vec)
-    transform_mat = numpy.eye(4)
-    transform_mat[:3, :3] = rotation_mat
-    transform_mat[:3, 3] = translation.flatten()
-    return transform_mat
+    _ = observation, camera_intrinsic
+    return numpy.eye(4)
 
 
 #################################################################### Geometry 
@@ -332,51 +254,6 @@ def get_transform_cube_geometry(observation, camera_intrinsic, camera_pose):
     return (t_robot_cube, t_cam_cube), seg_msg, height_m
 
 
-#################################################################### AprilTag on cube 
-
-def get_transform_cube_apriltag(observation, camera_intrinsic, camera_pose):
-    """Get cube pose from the small AprilTag; rotation is cleaned to a proper rotation matrix.
-
-    Inputs: observation — image; camera_intrinsic — K; camera_pose — world-to-camera 4x4.
-    Outputs: (cube_in_robot_frame, cube_in_camera_frame) or None if the tag is not seen.
-    """
-    detector = Detector(families=CUBE_TAG_FAMILY)
-
-    if len(observation.shape) > 2:
-        gray = cv2.cvtColor(observation, cv2.COLOR_BGRA2GRAY)
-    else:
-        gray = observation
-
-    tags = detector.detect(
-        gray,
-        estimate_tag_pose=True,
-        camera_params=(
-            float(camera_intrinsic[0, 0]),
-            float(camera_intrinsic[1, 1]),
-            float(camera_intrinsic[0, 2]),
-            float(camera_intrinsic[1, 2]),
-        ),
-        tag_size=CUBE_TAG_SIZE,
-    )
-
-    cube_tag = None
-    for tag in tags:
-        if tag.tag_id == CUBE_TAG_ID:
-            cube_tag = tag
-            break
-
-    if cube_tag is None:
-        return None
-
-    t_cam_cube = numpy.eye(4)
-    t_cam_cube[:3, :3] = orthonormalize_rotation(numpy.asarray(cube_tag.pose_R, dtype=numpy.float64))
-    t_cam_cube[:3, 3] = cube_tag.pose_t.flatten()
-
-    t_robot_cam = numpy.linalg.inv(camera_pose)
-    t_robot_cube = t_robot_cam @ t_cam_cube
-    return t_robot_cube, t_cam_cube
-
-
 def average_pose_matrices(mats):
     """Merge several 4x4 poses: median translation, quaternion mean of rotations.
 
@@ -397,20 +274,12 @@ def average_pose_matrices(mats):
     return out
 
 
-def detect_cube_pose_once(observation, camera_intrinsic, t_cam_robot, prefer_apriltag):
-    """One detection try: tag first, else geometry (single frame).
+def detect_cube_pose_once(observation, camera_intrinsic, t_cam_robot):
+    """One geometry-only detection attempt (single frame).
 
-    Inputs: observation — (image, point_cloud); camera_intrinsic — K; t_cam_robot — world-to-camera;
-            prefer_apriltag — try tag first if True.
-    Outputs: (pose_robot, pose_cam, height_m, source) or (None, None, None, error_text).
+    Inputs: observation — (image, point_cloud); camera_intrinsic — K; t_cam_robot — camera-to-robot.
+    Outputs: (pose_robot, pose_cam, height_m, "geometry") or (None, None, None, error_text).
     """
-    image, _pc = observation
-    if prefer_apriltag:
-        tag = get_transform_cube_apriltag(image, camera_intrinsic, t_cam_robot)
-        if tag is not None:
-            t_r, t_c = tag
-            return t_r, t_c, CUBE_PHYSICAL_HEIGHT_M, "apriltag"
-
     g = get_transform_cube_geometry(observation, camera_intrinsic, t_cam_robot)
     if g[0] is None:
         return None, None, None, g[1]
@@ -422,14 +291,13 @@ def detect_cube_pose_unified(
     observation,
     camera_intrinsic,
     t_cam_robot,
-    prefer_apriltag=True,
     n_samples=None,
     sample_dt_s=None,
 ):
     """Detect cube pose; optionally average several frames for a steadier pose.
 
-    Inputs: observation — (image, point_cloud); camera_intrinsic — K; t_cam_robot — world-to-camera;
-            prefer_apriltag — try tag first; n_samples — frames to fuse (1 = no fusion);
+    Inputs: observation — (image, point_cloud); camera_intrinsic — K; t_cam_robot — camera-to-robot;
+            n_samples — frames to fuse (1 = no fusion);
             sample_dt_s — sleep between frames when n_samples > 1.
     Outputs: (pose_robot, pose_cam, height_m, source) or (None, None, None, error_text).
     """
@@ -438,7 +306,7 @@ def detect_cube_pose_unified(
 
     if n_samples <= 1:
         r = detect_cube_pose_once(
-            observation, camera_intrinsic, t_cam_robot, prefer_apriltag
+            observation, camera_intrinsic, t_cam_robot
         )
         if r[0] is None:
             return None, None, None, r[3]
@@ -448,7 +316,7 @@ def detect_cube_pose_unified(
     last_err = "no samples"
     for _ in range(n_samples):
         r = detect_cube_pose_once(
-            observation, camera_intrinsic, t_cam_robot, prefer_apriltag
+            observation, camera_intrinsic, t_cam_robot
         )
         if r[0] is not None:
             ok.append(r)
@@ -624,13 +492,12 @@ def run_challenge_standard_tower(
     *,
     max_cubes=10,
     time_limit_s=60.0,
-    prefer_apriltag=True,
     dry_run_preview=True,
 ):
     """Fast tower challenge: multi-sample detect, adaptive safe-Z, timed gripper.
 
     Inputs: arm — xArm API; zed — camera; max_cubes — cap; time_limit_s — seconds;
-            prefer_apriltag — tag vs cloud; dry_run_preview — if True, show one frame and wait for 'k'.
+            dry_run_preview — if True, show one frame and wait for 'k'.
     Outputs: number of cubes placed (int).
     """
     camera_intrinsic = zed.camera_intrinsic
@@ -646,9 +513,7 @@ def run_challenge_standard_tower(
             print("Calibration failed (arena tags).")
             return 0
         obs = (cv_image, point_cloud)
-        det = detect_cube_pose_unified(
-            obs, camera_intrinsic, t_cam_robot, prefer_apriltag=prefer_apriltag
-        )
+        det = detect_cube_pose_unified(obs, camera_intrinsic, t_cam_robot)
         if det[0] is None:
             print("Preview detect failed:", det[3])
             return 0
@@ -683,7 +548,6 @@ def run_challenge_standard_tower(
         (zed.image, zed.point_cloud),
         camera_intrinsic,
         t_cam_robot,
-        prefer_apriltag=prefer_apriltag,
     )
     if base_det[0] is None:
         print("Could not get base pose:", base_det[3])
@@ -700,7 +564,6 @@ def run_challenge_standard_tower(
             (zed.image, zed.point_cloud),
             camera_intrinsic,
             t_cam_robot,
-            prefer_apriltag=prefer_apriltag,
         )
         if det[0] is None:
             print("Detect failed:", det[3])
@@ -743,7 +606,6 @@ def main():
             zed,
             max_cubes=10,
             time_limit_s=60.0,
-            prefer_apriltag=True,
             dry_run_preview=True,
         )
         print(f"RRC1: placed {n} cube(s).")
