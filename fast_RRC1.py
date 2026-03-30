@@ -9,44 +9,57 @@ from checkpoint0 import get_transform_camera_robot
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 from checkpoint4 import STACK_HEIGHT
 
-# ---------- simple fast mask from depth ----------
+# ---------- project filtered point cloud to 2D mask ----------
 
-def simple_depth_mask(cloud, min_z=0.1, max_z=1.0):
+def filtered_pcd_mask(image, pcd, K):
     """
-    Very fast 2D mask: white where depth is between min_z and max_z.
-    This shows approximate cube shapes without DBSCAN.
+    Create a 2D mask by projecting the filtered Open3D point cloud
+    (after voxel + outlier + plane removal) into the RGB image.
+    This shows EXACTLY what the cube detector sees.
     """
-    if cloud is None:
-        return None
+    H, W = image.shape[:2]
+    mask = numpy.zeros((H, W, 3), dtype=numpy.uint8)
 
-    depth = cloud[..., 2]  # Z in meters
-    mask = (depth > min_z) & (depth < max_z)
+    if pcd is None or len(pcd.points) == 0:
+        return mask
 
-    mask_img = numpy.zeros((*mask.shape, 3), dtype=numpy.uint8)
-    mask_img[mask] = (255, 255, 255)
+    pts = numpy.asarray(pcd.points)  # Nx3
 
-    # Optional smoothing
-    mask_img = cv2.medianBlur(mask_img, 5)
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
 
-    return mask_img
+    X = pts[:, 0]
+    Y = pts[:, 1]
+    Z = pts[:, 2]
+
+    valid = Z > 1e-6
+    X = X[valid]
+    Y = Y[valid]
+    Z = Z[valid]
+
+    u = (X * fx / Z + cx).astype(int)
+    v = (Y * fy / Z + cy).astype(int)
+
+    ok = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    u = u[ok]
+    v = v[ok]
+
+    mask[v, u] = (255, 255, 255)
+    mask = cv2.medianBlur(mask, 5)
+    return mask
 
 # ---------- geometry helpers ----------
 
 def scale_xyz_to_meters_frame(xyz):
     m = numpy.nanmax(numpy.abs(xyz))
     s = 0.001 if m > 50 else 1.0
-    print(f"[scale_xyz] max abs={m:.3f}, scale={s}")
     return xyz * s, s
 
 def segment_top_n_cubes_open3d(pcd, max_cubes=3, cube_min=0.02, cube_max=0.06):
-    print(f"[segment] input points: {len(pcd.points)}")
     pcd = pcd.voxel_down_sample(0.003)
-    print(f"[segment] after voxel: {len(pcd.points)}")
     pcd, _ = pcd.remove_statistical_outlier(25, 2.0)
-    print(f"[segment] after outlier: {len(pcd.points)}")
 
     if len(pcd.points) == 0:
-        print("[segment] no points after filtering")
         return [], "empty"
 
     plane, inliers = pcd.segment_plane(0.01, 3, 1500)
@@ -168,8 +181,8 @@ def preview_n_cubes(image, cloud, K, detector, max_cubes, cube_min, cube_max):
         (image, cloud), max_cubes=max_cubes, cube_min=cube_min, cube_max=cube_max
     )
 
-    # --- FAST MASK ---
-    mask = simple_depth_mask(cloud)
+    # --- TRUE FILTERED MASK ---
+    mask = filtered_pcd_mask(image, pcd_filt, K)
     cv2.imshow("cluster_mask", mask)
     cv2.waitKey(0)
     cv2.destroyWindow("cluster_mask")
