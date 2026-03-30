@@ -144,7 +144,13 @@ def get_all_cube_transforms(observation, camera_intrinsic, camera_pose):
             continue
 
         cluster = pcd.select_by_index(idx)
-        obb = cluster.get_oriented_bounding_box()
+
+        # NEW: re-validate cluster as a cube
+        cube_cluster, _msg = isolate_cube_cluster_open3d(cluster)
+        if cube_cluster is None or len(cube_cluster.points) < 30:
+            continue
+
+        obb = cube_cluster.get_oriented_bounding_box()
 
         center = numpy.asarray(obb.center)
         R_cam_cube = numpy.asarray(obb.R)
