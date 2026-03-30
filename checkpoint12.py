@@ -8,6 +8,8 @@ from utils.zed_camera import ZedCamera
 from checkpoint0 import get_transform_camera_robot
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 
+CUBE_SIZE = 0.025
+
 
 def points_to_meters_open3d(xyz):
     """
@@ -144,7 +146,7 @@ def get_cube_transforms(observation, camera_intrinsic, camera_pose):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(valid_points_m)
 
-    cube_pcds, _ = isolate_cube_cluster_open3d(pcd, num_cubes=14)
+    cube_pcds, _ = isolate_cube_cluster_open3d(pcd, num_cubes=12)
 
     transforms = []
 
@@ -251,6 +253,9 @@ def main():
 
         t_robot_cube, _t_cam_cube = cube_transforms[0]
 
+        t_robot_cube_2, _ = cube_transforms[1]
+
+
         cv2.namedWindow("Verifying Cube Pose", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Verifying Cube Pose", 1280, 720)
         cv2.imshow("Verifying Cube Pose", disp)
@@ -262,8 +267,16 @@ def main():
             print(
                 f"Cube in robot frame (m): x={xyz[0]:.3f}, y={xyz[1]:.3f}, z={xyz[2]:.3f}"
             )
+
+            t_robot_stack = t_robot_cube
+
             grasp_cube(arm, t_robot_cube)
             place_cube(arm, t_robot_cube)
+
+            t_robot_stack[2, 3] += CUBE_SIZE
+
+            grasp_cube(arm, t_robot_cube_2)
+            place_cube(arm, t_robot_stack)
             arm.stop_lite6_gripper()
         else:
             cv2.destroyAllWindows()
