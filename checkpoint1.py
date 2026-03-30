@@ -12,7 +12,7 @@ CUBE_TAG_FAMILY = 'tag36h11'
 CUBE_TAG_ID = 4
 CUBE_TAG_SIZE = 0.02
 
-robot_ip = '192.168.1.182'
+robot_ip = '192.168.1.159'
 
 # Motion constants (meters / degrees)
 SAFE_Z = 0.22
