@@ -20,8 +20,8 @@ except Exception:
 
 # If you have a known camera->robot transform, save it as 4x4 float matrix here.
 CAMERA_TO_ROBOT_PATH = "camera_to_robot.npy"
-GPU_Z_MIN_M = 0.05
-GPU_Z_MAX_M = 1.20
+GPU_Z_MIN_M = 0.30
+GPU_Z_MAX_M = 2.00
 MAX_CUBES = 8
 VOXEL_M = 0.0025
 PLANE_DIST_M = 0.008
@@ -52,6 +52,7 @@ def get_camera_to_robot_transform():
         T = numpy.load(CAMERA_TO_ROBOT_PATH)
         if T.shape == (4, 4):
             return T.astype(numpy.float64)
+    print("[mask_RRC] WARNING: camera_to_robot.npy not found; using identity transform.")
     return numpy.eye(4, dtype=numpy.float64)
 
 
@@ -185,29 +186,44 @@ def stabilized_pose_from_cluster(cluster, plane_normal_cam):
     """
     pts = numpy.asarray(cluster.points)
     obb = cluster.get_oriented_bounding_box()
+
+    # Robust center: median is less sensitive to outliers than OBB center.
     center_med = numpy.median(pts, axis=0)
     center_obb = numpy.asarray(obb.center)
-    center = 0.65 * center_med + 0.35 * center_obb
+    center = 0.75 * center_med + 0.25 * center_obb
 
-    R = orthonormalize_rotation(numpy.asarray(obb.R))
+    # Use table normal for z-axis and PCA in table plane for yaw.
     if plane_normal_cam is not None and numpy.linalg.norm(plane_normal_cam) > 1e-9:
-        n = plane_normal_cam / numpy.linalg.norm(plane_normal_cam)
-        # Pick OBB axis most aligned with table normal as local z-axis for consistent yaw.
-        axes = [R[:, 0], R[:, 1], R[:, 2]]
-        best = int(numpy.argmax([abs(float(numpy.dot(a, n))) for a in axes]))
-        z_axis = axes[best]
-        if numpy.dot(z_axis, n) < 0:
+        z_axis = plane_normal_cam / numpy.linalg.norm(plane_normal_cam)
+    else:
+        R_obb = orthonormalize_rotation(numpy.asarray(obb.R))
+        axes = [R_obb[:, 0], R_obb[:, 1], R_obb[:, 2]]
+        z_axis = max(axes, key=lambda a: abs(float(a[2])))
+        if z_axis[2] < 0:
             z_axis = -z_axis
-        x_guess = axes[(best + 1) % 3]
-        x_axis = x_guess - numpy.dot(x_guess, z_axis) * z_axis
-        if numpy.linalg.norm(x_axis) < 1e-9:
-            x_guess = axes[(best + 2) % 3]
-            x_axis = x_guess - numpy.dot(x_guess, z_axis) * z_axis
-        x_axis /= (numpy.linalg.norm(x_axis) + 1e-12)
-        y_axis = numpy.cross(z_axis, x_axis)
-        y_axis /= (numpy.linalg.norm(y_axis) + 1e-12)
-        R = numpy.column_stack([x_axis, y_axis, z_axis])
-        R = orthonormalize_rotation(R)
+
+    # Project points onto plane orthogonal to z_axis, then PCA for in-plane direction.
+    q = pts - center[None, :]
+    q_plane = q - (q @ z_axis)[:, None] * z_axis[None, :]
+    if q_plane.shape[0] >= 3:
+        C = q_plane.T @ q_plane / max(q_plane.shape[0] - 1, 1)
+        w, V = numpy.linalg.eigh(C)
+        x_axis = V[:, int(numpy.argmax(w))]
+    else:
+        R_obb = orthonormalize_rotation(numpy.asarray(obb.R))
+        x_axis = R_obb[:, 0]
+
+    x_axis = x_axis - numpy.dot(x_axis, z_axis) * z_axis
+    if numpy.linalg.norm(x_axis) < 1e-9:
+        # Deterministic fallback axis orthogonal to z.
+        tmp = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float64)
+        if abs(float(numpy.dot(tmp, z_axis))) > 0.9:
+            tmp = numpy.array([0.0, 1.0, 0.0], dtype=numpy.float64)
+        x_axis = tmp - numpy.dot(tmp, z_axis) * z_axis
+    x_axis /= (numpy.linalg.norm(x_axis) + 1e-12)
+    y_axis = numpy.cross(z_axis, x_axis)
+    y_axis /= (numpy.linalg.norm(y_axis) + 1e-12)
+    R = orthonormalize_rotation(numpy.column_stack([x_axis, y_axis, z_axis]))
 
     ext = numpy.sort(numpy.asarray(obb.extent))
     h_m = float(ext[2])
