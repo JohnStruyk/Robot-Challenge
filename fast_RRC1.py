@@ -8,7 +8,7 @@ from checkpoint0 import get_transform_camera_robot
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 from checkpoint4 import STACK_HEIGHT
 
-# --- geometry helpers ---
+# ---------- geometry helpers ----------
 
 def scale_xyz_to_meters_frame(xyz):
     m = numpy.nanmax(numpy.abs(xyz))
@@ -25,7 +25,7 @@ def segment_top_n_cubes_open3d(pcd, max_cubes=3, cube_min=0.02, cube_max=0.06):
 
     if len(pcd.points) == 0:
         print("[segment] no points after filtering")
-        return [], "empty"
+        return [], "empty", pcd, numpy.array([])
 
     plane, inliers = pcd.segment_plane(0.01, 3, 1500)
     print(f"[segment] plane inliers: {len(inliers)} / {len(pcd.points)}")
@@ -36,12 +36,12 @@ def segment_top_n_cubes_open3d(pcd, max_cubes=3, cube_min=0.02, cube_max=0.06):
     labels = numpy.asarray(pcd.cluster_dbscan(0.02, 25))
     if labels.size == 0:
         print("[segment] DBSCAN labels empty")
-        return [], "no clusters"
+        return [], "no clusters", pcd, labels
     print(f"[segment] DBSCAN labels: min={labels.min()}, max={labels.max()}")
 
     if labels.max() < 0:
         print("[segment] no valid cluster labels")
-        return [], "no clusters"
+        return [], "no clusters", pcd, labels
 
     scored = []
     for cid in range(labels.max() + 1):
@@ -57,7 +57,6 @@ def segment_top_n_cubes_open3d(pcd, max_cubes=3, cube_min=0.02, cube_max=0.06):
 
         print(f"[segment] cluster {cid}: pts={idx.size}, ext={ext}, center={center}")
 
-        # cube-size filter (tune these with your real cube edge length)
         maxd = float(ext[2])
         mind = float(ext[0])
         if not (cube_min <= maxd <= cube_max):
@@ -75,12 +74,12 @@ def segment_top_n_cubes_open3d(pcd, max_cubes=3, cube_min=0.02, cube_max=0.06):
 
     print(f"[segment] scored cube-like clusters: {len(scored)}")
     if not scored:
-        return [], "no cube-like clusters"
+        return [], "no cube-like clusters", pcd, labels
 
     scored.sort(key=lambda x: x[0], reverse=True)
     top = [c for _, c in scored[:max_cubes]]
     print(f"[segment] returning {len(top)} clusters (max_cubes={max_cubes})")
-    return top, "ok"
+    return top, "ok", pcd, labels
 
 def camera_pose_from_cluster_pcd(cluster):
     obb = cluster.get_oriented_bounding_box()
@@ -90,7 +89,32 @@ def camera_pose_from_cluster_pcd(cluster):
     print(f"[pose] center={T[:3,3]}")
     return T
 
-# --- detector ---
+def cluster_binary_mask(image, pcd, labels, K):
+    """Simple binary mask of all clustered points."""
+    mask = numpy.zeros((image.shape[0], image.shape[1], 3), dtype=numpy.uint8)
+    if labels is None or labels.size == 0 or len(pcd.points) == 0:
+        return mask
+
+    xyz = numpy.asarray(pcd.points)
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    z = xyz[:, 2]
+    valid = z > 1e-6
+    pts = xyz[valid]
+    if pts.shape[0] == 0:
+        return mask
+
+    u = (pts[:, 0] * fx / pts[:, 2] + cx).astype(int)
+    v = (pts[:, 1] * fy / pts[:, 2] + cy).astype(int)
+
+    ok = (u >= 0) & (u < mask.shape[1]) & (v >= 0) & (v < mask.shape[0])
+    u, v = u[ok], v[ok]
+
+    mask[v, u] = (255, 255, 255)
+    return mask
+
+# ---------- detector ----------
 
 class CubePoseDetector:
     def __init__(self, camera_intrinsic):
@@ -105,7 +129,7 @@ class CubePoseDetector:
         image, cloud = observation
         if image is None or cloud is None:
             print("[detector] image or cloud is None")
-            return None, "no data"
+            return None, "no data", None, None
 
         xyz = cloud[..., :3]
         print(f"[detector] raw xyz shape: {xyz.shape}")
@@ -116,17 +140,17 @@ class CubePoseDetector:
 
         if pts.shape[0] < 100:
             print(f"[detector] too few finite pts: {pts.shape[0]}")
-            return None, "too few points"
+            return None, "too few points", None, None
 
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts.astype(numpy.float64))
 
-        clusters, msg = segment_top_n_cubes_open3d(
+        clusters, msg, pcd_filt, labels = segment_top_n_cubes_open3d(
             pcd, max_cubes=max_cubes, cube_min=cube_min, cube_max=cube_max
         )
         print(f"[detector] segment msg: {msg}")
         if not clusters:
-            return None, "no cubes"
+            return None, "no cubes", pcd_filt, labels
 
         T_rc = numpy.linalg.inv(self.t_cam_robot)
         out = []
@@ -135,9 +159,9 @@ class CubePoseDetector:
             T_robot = T_rc @ T_cam
             print(f"[detector] cube {i} robot xyz={T_robot[:3,3]}")
             out.append((T_robot, T_cam))
-        return out, "ok"
+        return out, "ok", pcd_filt, labels
 
-# --- preview (no projection) ---
+# ---------- preview (with binary mask) ----------
 
 def preview_n_cubes(image, cloud, K, detector, max_cubes, cube_min, cube_max):
     print("[preview] starting preview")
@@ -150,10 +174,16 @@ def preview_n_cubes(image, cloud, K, detector, max_cubes, cube_min, cube_max):
     print(f"[preview] T_cam_robot:\n{T}")
     detector.set_camera_pose(T)
 
-    results, msg = detector.get_n_cubes(
+    results, msg, pcd_filt, labels = detector.get_n_cubes(
         (image, cloud), max_cubes=max_cubes, cube_min=cube_min, cube_max=cube_max
     )
     print(f"[preview] get_n_cubes msg: {msg}")
+
+    mask = cluster_binary_mask(image, pcd_filt if pcd_filt is not None else o3d.geometry.PointCloud(),
+                               labels if labels is not None else numpy.array([]), K)
+    cv2.imshow("cluster_mask", mask)
+    cv2.waitKey(1)
+
     if results is None:
         disp = image.copy()
         cv2.putText(disp, msg, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
@@ -169,7 +199,7 @@ def preview_n_cubes(image, cloud, K, detector, max_cubes, cube_min, cube_max):
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
     return poses_robot, disp, True
 
-# --- stacking ---
+# ---------- stacking ----------
 
 def run_tower_sequence(arm, poses_robot):
     names = list(poses_robot.keys())
@@ -187,14 +217,14 @@ def run_tower_sequence(arm, poses_robot):
         place_cube(arm, T)
         arm.stop_lite6_gripper()
 
-# --- main ---
+# ---------- main ----------
 
 def main():
     NUM_CUBES = 6
 
-    # TODO: set these to your real cube size in meters
-    CUBE_MIN = 0.02   # min cube edge
-    CUBE_MAX = 0.06   # max cube edge
+    # tune these to your real cube size (meters)
+    CUBE_MIN = 0.02
+    CUBE_MAX = 0.06
 
     zed = ZedCamera()
     K = zed.camera_intrinsic
