@@ -268,15 +268,16 @@ def main():
                 f"Cube in robot frame (m): x={xyz[0]:.3f}, y={xyz[1]:.3f}, z={xyz[2]:.3f}"
             )
 
+
+
             t_robot_stack = t_robot_cube
 
-            grasp_cube(arm, t_robot_cube)
-            place_cube(arm, t_robot_cube)
+            for i in range(7):
+                t_robot_cube, _ = cube_transforms[i]
+                grasp_cube(arm, t_robot_cube)
+                place_cube(arm, t_robot_stack)
+                t_robot_stack[2, 3] += CUBE_SIZE
 
-            t_robot_stack[2, 3] += CUBE_SIZE
-
-            grasp_cube(arm, t_robot_cube_2)
-            place_cube(arm, t_robot_stack)
             arm.stop_lite6_gripper()
         else:
             cv2.destroyAllWindows()
