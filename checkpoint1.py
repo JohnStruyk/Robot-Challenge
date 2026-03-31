@@ -56,7 +56,7 @@ def grasp_cube(arm, cube_pose):
     arm.set_position(x_mm, y_mm, grasp_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=50)
     arm.close_lite6_gripper()
     #arm.stop_lite6_gripper()
-    time.sleep(1)
+    time.sleep(0.7)
     arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=300)
 
 def place_cube(arm, cube_pose):
