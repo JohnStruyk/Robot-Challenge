@@ -7,6 +7,7 @@ from utils.vis_utils import draw_pose_axes
 from utils.zed_camera import ZedCamera
 from checkpoint0 import get_transform_camera_robot
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
+from best_RRC1 import grasp_cube_fast, place_cube_fast
 
 CUBE_SIZE = 0.025
 STACK_HEIGHT_GOAL = 9
@@ -295,14 +296,14 @@ def main():
                 f"Cube in robot frame (m): x={xyz[0]:.3f}, y={xyz[1]:.3f}, z={xyz[2]:.3f}"
             )
 
-
-
             t_robot_stack = t_robot_cube
 
             for i in range(STACK_HEIGHT_GOAL):
                 t_robot_cube, _ = cube_transforms[i]
-                grasp_cube(arm, t_robot_cube)
-                place_cube(arm, t_robot_stack)
+                # grasp_cube(arm, t_robot_cube)
+                # place_cube(arm, t_robot_stack)
+                grasp_cube_fast(arm, t_robot_cube)
+                place_cube_fast(arm, t_robot_stack)
                 t_robot_stack[2, 3] += CUBE_SIZE
 
             arm.stop_lite6_gripper()
