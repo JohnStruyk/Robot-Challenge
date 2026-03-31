@@ -9,6 +9,7 @@ from checkpoint0 import get_transform_camera_robot
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 
 CUBE_SIZE = 0.025
+STACK_HEIGHT_GOAL = 9
 
 
 def points_to_meters_open3d(xyz):
@@ -172,7 +173,7 @@ def get_cube_transforms(observation, camera_intrinsic, camera_pose):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(valid_points_m)
 
-    cube_pcds, _ = isolate_cube_cluster_open3d(pcd, num_cubes=9)
+    cube_pcds, _ = isolate_cube_cluster_open3d(pcd, num_cubes=STACK_HEIGHT_GOAL)
 
     transforms = []
 
@@ -298,7 +299,7 @@ def main():
 
             t_robot_stack = t_robot_cube
 
-            for i in range(7):
+            for i in range(STACK_HEIGHT_GOAL):
                 t_robot_cube, _ = cube_transforms[i]
                 grasp_cube(arm, t_robot_cube)
                 place_cube(arm, t_robot_stack)
