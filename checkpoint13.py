@@ -109,33 +109,41 @@ def get_cube_transform(cube_pcd, camera_pose):
     if cube_pcd is None or len(cube_pcd.points) < 30:
         return None
 
+    # --- 1. Extract OBB and center ---
     obb = cube_pcd.get_oriented_bounding_box()
     center = numpy.asarray(obb.center)
 
-    # Extract raw PCA rotation
+    # --- 2. Raw PCA rotation ---
     R_raw = numpy.array(obb.R, dtype=float, copy=True)
 
-    # --- 1. Extract yaw from the OBB X-axis ---
-    # X-axis projected into table plane
-    x = R_raw[:, 0]
-    yaw = numpy.arctan2(x[1], x[0])
+    # --- 3. Compute world Z axis in camera frame ---
+    # camera_pose = T_cam_robot, so invert to get T_robot_cam
+    R_cam_robot = camera_pose[:3, :3]
+    z_world_cam = R_cam_robot @ numpy.array([0, 0, 1], float)
+    z_axis = z_world_cam / numpy.linalg.norm(z_world_cam)
 
-    # --- 2. Build a clean rotation matrix with roll=pitch=0 ---
-    cy = numpy.cos(yaw)
-    sy = numpy.sin(yaw)
+    # --- 4. Project PCA X axis into table plane ---
+    x_raw = numpy.array(R_raw[:, 0], float)
+    x_proj = x_raw - numpy.dot(x_raw, z_axis) * z_axis
+    x_proj /= numpy.linalg.norm(x_proj)
 
+    # --- 5. Extract yaw from projected X axis ---
+    yaw = numpy.arctan2(x_proj[1], x_proj[0])
+
+    # --- 6. Build clean rotation matrix (roll=pitch=0) ---
+    cy, sy = numpy.cos(yaw), numpy.sin(yaw)
     R_fixed = numpy.array([
         [ cy, -sy, 0.0],
         [ sy,  cy, 0.0],
         [0.0, 0.0, 1.0]
     ])
 
-    # --- 3. Build camera-frame transform ---
+    # --- 7. Build camera-frame transform ---
     t_cam_cube = numpy.eye(4)
     t_cam_cube[:3, :3] = R_fixed
     t_cam_cube[:3, 3] = center
 
-    # --- 4. Convert to robot frame ---
+    # --- 8. Convert to robot frame ---
     t_robot_cam = numpy.linalg.inv(camera_pose)
     t_robot_cube = t_robot_cam @ t_cam_cube
 
@@ -290,7 +298,16 @@ def main():
                 f"Cube in robot frame (m): x={xyz[0]:.3f}, y={xyz[1]:.3f}, z={xyz[2]:.3f}"
             )
 
-            t_robot_stack = t_robot_cube
+            # Hardcoded first cube placement (convert mm → m)
+            X_FIXED = 0.370
+            Y_FIXED = 0.020
+
+            # Copy the detected transform
+            t_robot_stack = t_robot_cube.copy()
+
+            # Overwrite only X and Y
+            t_robot_stack[0, 3] = X_FIXED
+            t_robot_stack[1, 3] = Y_FIXED
 
             for i in range(STACK_HEIGHT_GOAL):
                 t_robot_cube, _ = cube_transforms[i]
