@@ -15,9 +15,9 @@ CUBE_TAG_SIZE = 0.02
 robot_ip = '192.168.1.159'
 
 # Motion constants (meters / degrees)
-SAFE_Z = 0.22
+SAFE_Z = 0.07
 GRASP_Z_OFFSET = 0.003
-LIFT_Z_DELTA = 0.06
+LIFT_Z_DELTA = 0.04
 PLACE_Z_OFFSET = 0.01
 
 # Keep tool mostly vertical; only yaw is adapted from cube pose.
@@ -49,15 +49,15 @@ def grasp_cube(arm, cube_pose):
     # Ensure gripper is open before approach.
     arm.open_lite6_gripper()
     #arm.stop_lite6_gripper()
-    time.sleep(1)
+    time.sleep(0.3)
 
     # Approach -> descend -> grasp -> lift.
-    arm.set_position(x_mm, y_mm, safe_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
-    arm.set_position(x_mm, y_mm, grasp_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
+    arm.set_position(x_mm, y_mm, safe_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=300)
+    arm.set_position(x_mm, y_mm, grasp_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=50)
     arm.close_lite6_gripper()
     #arm.stop_lite6_gripper()
     time.sleep(1)
-    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
+    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=300)
 
 def place_cube(arm, cube_pose):
     """
@@ -77,15 +77,18 @@ def place_cube(arm, cube_pose):
     place_z_mm = z_mm + (PLACE_Z_OFFSET * 1000.0)
     lift_z_mm = max(safe_z_mm, place_z_mm + (LIFT_Z_DELTA * 1000.0))
 
+    lift_z_mm = place_z_mm + LIFT_Z_DELTA * 1000
+
     cube_r = Rotation.from_matrix(cube_pose[:3, :3])
     _, _, cube_yaw_deg = cube_r.as_euler('xyz', degrees=True)
 
-    arm.set_position(x_mm, y_mm, safe_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
-    arm.set_position(x_mm, y_mm, place_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
+
+    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=300)
+    arm.set_position(x_mm, y_mm, place_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=50)
     arm.open_lite6_gripper()
     #arm.stop_lite6_gripper()
-    time.sleep(1)
-    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True)
+    time.sleep(0.3)
+    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=300)
 
 def get_transform_cube(observation, camera_intrinsic, camera_pose):
     """
