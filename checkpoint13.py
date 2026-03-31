@@ -112,41 +112,35 @@ def get_cube_transform(cube_pcd, camera_pose):
     obb = cube_pcd.get_oriented_bounding_box()
     center = numpy.asarray(obb.center)
 
-    # Make sure this is a writable array
+    # Extract raw PCA rotation
     R_raw = numpy.array(obb.R, dtype=float, copy=True)
 
-    # --- 2. Extract stable Z axis (copy, not view) ---
-    z_axis = numpy.array(R_raw[:, 2], dtype=float, copy=True)
-    z_axis /= numpy.linalg.norm(z_axis)
+    # --- 1. Extract yaw from the OBB X-axis ---
+    # X-axis projected into table plane
+    x = R_raw[:, 0]
+    yaw = numpy.arctan2(x[1], x[0])
 
-    # --- 3. Project OBB X axis onto table plane to fix yaw ---
-    x_axis = numpy.array(R_raw[:, 0], dtype=float, copy=True)
-    x_axis = x_axis - numpy.dot(x_axis, z_axis) * z_axis
-    n = numpy.linalg.norm(x_axis)
-    if n < 1e-6:
-        tmp = numpy.array([1.0, 0.0, 0.0], dtype=float)
-        if abs(numpy.dot(tmp, z_axis)) > 0.9:
-            tmp = numpy.array([0.0, 1.0, 0.0], dtype=float)
-        x_axis = tmp - numpy.dot(tmp, z_axis) * z_axis
-    x_axis /= numpy.linalg.norm(x_axis)
+    # --- 2. Build a clean rotation matrix with roll=pitch=0 ---
+    cy = numpy.cos(yaw)
+    sy = numpy.sin(yaw)
 
-    # --- 4. Recompute Y axis ---
-    y_axis = numpy.cross(z_axis, x_axis)
-    y_axis /= numpy.linalg.norm(y_axis)
+    R_fixed = numpy.array([
+        [ cy, -sy, 0.0],
+        [ sy,  cy, 0.0],
+        [0.0, 0.0, 1.0]
+    ])
 
-    # --- 5. Final stable rotation matrix ---
-    R_fixed = numpy.column_stack([x_axis, y_axis, z_axis])
-
-    # --- 6. Build camera-frame transform ---
+    # --- 3. Build camera-frame transform ---
     t_cam_cube = numpy.eye(4)
     t_cam_cube[:3, :3] = R_fixed
     t_cam_cube[:3, 3] = center
 
-    # --- 7. Convert to robot frame ---
+    # --- 4. Convert to robot frame ---
     t_robot_cam = numpy.linalg.inv(camera_pose)
     t_robot_cube = t_robot_cam @ t_cam_cube
 
     return (t_robot_cube, t_cam_cube)
+
 
 def get_cube_transforms(observation, camera_intrinsic, camera_pose):
     """
