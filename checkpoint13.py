@@ -104,40 +104,28 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
     return None, "no cluster passed filters"
 
 def get_cube_transform(cube_pcd, camera_pose):
-    """
-    Compute a stable cube pose:
-    - Z axis from PCA (stable)
-    - X/Y axes recomputed in the table plane (fixes yaw drift)
-    - Center from OBB
-
-    Returns:
-        (t_robot_cube, t_cam_cube) or None
-    """
     if cube_pcd is None or len(cube_pcd.points) < 30:
         return None
 
-    # --- 1. Extract OBB and center ---
     obb = cube_pcd.get_oriented_bounding_box()
     center = numpy.asarray(obb.center)
 
-    # Raw PCA rotation (unstable yaw)
-    R_raw = numpy.asarray(obb.R)
+    # Make sure this is a writable array
+    R_raw = numpy.array(obb.R, dtype=float, copy=True)
 
-    # --- 2. Extract stable Z axis ---
-    z_axis = R_raw[:, 2]
+    # --- 2. Extract stable Z axis (copy, not view) ---
+    z_axis = numpy.array(R_raw[:, 2], dtype=float, copy=True)
     z_axis /= numpy.linalg.norm(z_axis)
 
     # --- 3. Project OBB X axis onto table plane to fix yaw ---
-    x_axis = R_raw[:, 0]
+    x_axis = numpy.array(R_raw[:, 0], dtype=float, copy=True)
     x_axis = x_axis - numpy.dot(x_axis, z_axis) * z_axis
     n = numpy.linalg.norm(x_axis)
     if n < 1e-6:
-    # pick a vector not parallel to z_axis
-        tmp = numpy.array([1.0, 0.0, 0.0])
+        tmp = numpy.array([1.0, 0.0, 0.0], dtype=float)
         if abs(numpy.dot(tmp, z_axis)) > 0.9:
-            tmp = numpy.array([0.0, 1.0, 0.0])
+            tmp = numpy.array([0.0, 1.0, 0.0], dtype=float)
         x_axis = tmp - numpy.dot(tmp, z_axis) * z_axis
-
     x_axis /= numpy.linalg.norm(x_axis)
 
     # --- 4. Recompute Y axis ---
