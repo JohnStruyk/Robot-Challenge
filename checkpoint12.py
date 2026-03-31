@@ -58,10 +58,12 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
     def score_cluster(cluster, idx):
         obb = cluster.get_oriented_bounding_box()
         ext = numpy.sort(numpy.asarray(obb.extent))
+        if ext[2] < 1e-9:
+            return -1.0, None
         max_dim = float(ext[2])
         min_dim = float(ext[0])
         compact = min_dim / max_dim if max_dim > 0 else 0.0
-        size_ok = 0.01 <= max_dim <= 0.04
+        size_ok = 0.008 <= max_dim <= 0.090
         if not size_ok:
             return float(idx.size) * 0.01, None
         qual = 1.0 if 0.25 < compact <= 1.0 else 0.3
@@ -250,6 +252,9 @@ def main():
         )
 
         t_robot_cube, _t_cam_cube = cube_transforms[0]
+
+        t_robot_cube_2, _ = cube_transforms[1]
+
 
         cv2.namedWindow("Verifying Cube Pose", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Verifying Cube Pose", 1280, 720)
