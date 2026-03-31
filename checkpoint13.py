@@ -172,7 +172,7 @@ def get_cube_transforms(observation, camera_intrinsic, camera_pose):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(valid_points_m)
 
-    cube_pcds, _ = isolate_cube_cluster_open3d(pcd, num_cubes=12)
+    cube_pcds, _ = isolate_cube_cluster_open3d(pcd, num_cubes=9)
 
     transforms = []
 

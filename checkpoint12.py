@@ -8,7 +8,7 @@ from utils.zed_camera import ZedCamera
 from checkpoint0 import get_transform_camera_robot
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 
-CUBE_SIZE = 0.025
+CUBE_SIZE = 0.026
 STACK_HEIGHT_GOAL = 9
 
 
@@ -63,6 +63,7 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
             return -1.0, None
         max_dim = float(ext[2])
         min_dim = float(ext[0])
+        print(str(max_dim) +" is max_dim and min_dim is "+str(min_dim))
         compact = min_dim / max_dim if max_dim > 0 else 0.0
         size_ok = 0.008 <= max_dim <= 0.090
         if not size_ok:
