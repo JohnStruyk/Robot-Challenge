@@ -104,23 +104,6 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
     return None, "no cluster passed filters"
 
 def get_cube_transform(cube_pcd, camera_pose):
-    if cube_pcd is None or len(cube_pcd.points) < 30:
-        return None
-
-    obb = cube_pcd.get_oriented_bounding_box()
-    center = numpy.asarray(obb.center)
-    R_cam_cube = numpy.asarray(obb.R)
-
-    t_cam_cube = numpy.eye(4)
-    t_cam_cube[:3, :3] = R_cam_cube
-    t_cam_cube[:3, 3] = center
-
-    t_robot_cam = numpy.linalg.inv(camera_pose)
-    t_robot_cube = t_robot_cam @ t_cam_cube
-
-    return (t_robot_cube, t_cam_cube)
-
-def get_cube_transform(cube_pcd, camera_pose):
     """
     Compute a stable cube pose:
     - Z axis from PCA (stable)
@@ -149,8 +132,12 @@ def get_cube_transform(cube_pcd, camera_pose):
     x_axis = x_axis - numpy.dot(x_axis, z_axis) * z_axis
     n = numpy.linalg.norm(x_axis)
     if n < 1e-6:
-        # fallback: pick any orthogonal vector
-        x_axis = numpy.array([1.0, 0.0, 0.0]) - z_axis * z_axis[0]
+    # pick a vector not parallel to z_axis
+        tmp = numpy.array([1.0, 0.0, 0.0])
+        if abs(numpy.dot(tmp, z_axis)) > 0.9:
+            tmp = numpy.array([0.0, 1.0, 0.0])
+        x_axis = tmp - numpy.dot(tmp, z_axis) * z_axis
+
     x_axis /= numpy.linalg.norm(x_axis)
 
     # --- 4. Recompute Y axis ---
@@ -171,6 +158,40 @@ def get_cube_transform(cube_pcd, camera_pose):
 
     return (t_robot_cube, t_cam_cube)
 
+def get_cube_transforms(observation, camera_intrinsic, camera_pose):
+    """
+    Estimate cube pose from image + point cloud (geometry; image for API only).
+
+    Returns
+    -------
+    tuple
+        On success: ``((t_robot_cube, t_cam_cube), status_message)``.
+        On failure: ``(None, status_message)``.
+    """
+    image, point_cloud = observation
+    if image is None or point_cloud is None:
+        return None, "missing image or point_cloud"
+
+    xyz = point_cloud[..., :3]
+    valid_mask = numpy.isfinite(xyz).all(axis=-1)
+    valid_points = xyz[valid_mask]
+
+    if valid_points.shape[0] < 100:
+        return None, f"too few finite points: {valid_points.shape[0]}"
+
+    valid_points_m, _scale = points_to_meters_open3d(valid_points)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(valid_points_m)
+
+    cube_pcds, _ = isolate_cube_cluster_open3d(pcd, num_cubes=12)
+
+    transforms = []
+
+    for pcd in cube_pcds:
+        transforms.append(get_cube_transform(pcd, camera_pose))
+
+    return transforms
 
 
 def draw_status_overlay(image_bgra, lines, color=(0, 220, 0)):
