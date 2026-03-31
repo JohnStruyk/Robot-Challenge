@@ -13,9 +13,9 @@ from utils.zed_camera import ZedCamera
 
 
 # Speed profile from mask_RRC.py: fast except final place descent.
-ARM_SPEED_FAST = 3000
-ARM_SPEED_PLACE = 140
-ARM_SPEED_GRASP_DOWN = 220
+ARM_SPEED_FAST = 2000
+ARM_SPEED_PLACE = 90
+ARM_SPEED_GRASP_DOWN = 120
 GRIPPER_SETTLE_S = 0.50
 RELEASE_WAIT_S = 0.80
 
