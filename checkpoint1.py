@@ -15,7 +15,8 @@ CUBE_TAG_SIZE = 0.02
 robot_ip = '192.168.1.159'
 
 # Motion constants (meters / degrees)
-SAFE_Z = 0.07
+APPROACH_Z = 0.15
+SAFE_Z = 0.055
 GRASP_Z_OFFSET = 0.003
 LIFT_Z_DELTA = 0.04
 PLACE_Z_OFFSET = 0.01
@@ -41,6 +42,7 @@ def grasp_cube(arm, cube_pose):
     safe_z_mm = SAFE_Z * 1000.0
     grasp_z_mm = z_mm + (GRASP_Z_OFFSET * 1000.0)
     lift_z_mm = max(safe_z_mm, grasp_z_mm + (LIFT_Z_DELTA * 1000.0))
+    approach_z_mm = APPROACH_Z * 1000
 
     # Align tool yaw with cube yaw so the parallel jaws are more likely to seat cleanly.
     cube_r = Rotation.from_matrix(cube_pose[:3, :3])
@@ -52,6 +54,7 @@ def grasp_cube(arm, cube_pose):
     time.sleep(0.3)
 
     # Approach -> descend -> grasp -> lift.
+    arm.set_position(x_mm, y_mm, approach_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=300)
     arm.set_position(x_mm, y_mm, safe_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=300)
     arm.set_position(x_mm, y_mm, grasp_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=50)
     arm.close_lite6_gripper()
