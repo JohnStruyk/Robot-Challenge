@@ -1,10 +1,17 @@
 """
-orientation_RRC — checkpoint22 segmentation + upright cube frames.
+orientation_RRC — checkpoint22 clustering + **physical cube** pose on a table.
 
-Uses the same clustering as ``checkpoint22.py``. The **center** uses identical-cube
-geometry: midpoint of extent along robot-up plus robust in-plane median (with a
-small OBB blend). Orientation forces **+Z = robot +Z** in camera frame, **+X**
-from the first usable horizontal OBB axis, **+Y = Z × X**.
+Assumes each object is a **cube with one face flush on the table** (any yaw).
+
+- Fits the **table plane** once (RANSAC) before removing it; cube **+Z** aligns
+  with the table normal (flipped to match robot +Z in the camera frame).
+- **Bottom face**: points closest to the table (lowest height percentiles) define
+  the **contact footprint** — this reduces depth / “too far forward” bias from
+  using the whole cloud or OBB center.
+- **Center** = center of bottom face on the plane + ``(CUBE_SIZE/2) * n``, then a
+  small **bound-centering** step in the fitted cube frame so the point cloud is
+  symmetric in ``[-s/2,s/2]^3``.
+- **Yaw** from ``cv2.minAreaRect`` on the bottom-face footprint in the table plane.
 
 Run from any working directory: project root is added to ``sys.path`` so
 ``utils.zed_camera`` and checkpoints resolve.
@@ -33,8 +40,10 @@ from utils.zed_camera import ZedCamera
 
 CUBE_SIZE_M = 0.025
 STACK_HEIGHT_GOAL = 12
-# Blend robust geometric center with OBB (same-size cubes: median + extent beats OBB alone)
-OBB_CENTER_BLEND = 0.12
+# Bottom-face layer: fraction of height range used to approximate the face on the table
+BOTTOM_LAYER_FRAC = 0.22
+# Refinement: snap translation so AABB in cube frame matches cloud (1–2 passes)
+BOUND_CENTER_ITERS = 2
 
 
 def orthonormalize_rotation(R: numpy.ndarray) -> numpy.ndarray:
@@ -57,33 +66,39 @@ def points_to_meters_open3d(xyz):
 
 
 def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
-    """Same as checkpoint22: voxel, outliers, plane, DBSCAN, score, fallback."""
+    """
+    Same as checkpoint22: voxel, outliers, plane, DBSCAN, score, fallback.
+
+    Also returns ``plane_model`` (4-vector ``ax+by+cz+d=0``) from the **first**
+    table RANSAC — needed to place cube centers on the physical table plane.
+    """
     if len(pcd.points) < 150:
-        return None, "too few points after NaN filter"
+        return None, "too few points after NaN filter", None
 
     pcd = pcd.voxel_down_sample(voxel_size=0.003)
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=25, std_ratio=2.0)
 
     if len(pcd.points) < 100:
-        return None, "too few points after voxel/outlier"
+        return None, "too few points after voxel/outlier", None
 
     plane_model, inliers = pcd.segment_plane(
         distance_threshold=0.010,
         ransac_n=3,
         num_iterations=1500,
     )
+    plane_np = numpy.asarray(plane_model, dtype=numpy.float64).copy()
     if len(inliers) > 0 and len(inliers) > 0.12 * len(pcd.points):
         pcd = pcd.select_by_index(inliers, invert=True)
 
     if len(pcd.points) < 80:
-        return None, "nothing left after plane removal"
+        return None, "nothing left after plane removal", plane_np
 
     labels = numpy.asarray(
         pcd.cluster_dbscan(eps=0.020, min_points=25, print_progress=False)
     )
     max_label = int(labels.max()) if labels.size else -1
     if max_label < 0:
-        return None, "DBSCAN found no clusters"
+        return None, "DBSCAN found no clusters", plane_np
 
     def score_cluster(cluster, idx):
         obb = cluster.get_oriented_bounding_box()
@@ -121,72 +136,163 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
 
     if len(scored_clusters) > 0:
         top_clusters = [c for (_, c) in scored_clusters[:num_cubes]]
-        return top_clusters, f"{len(top_clusters)} cube-like clusters"
+        return top_clusters, f"{len(top_clusters)} cube-like clusters", plane_np
 
     fallback_clusters.sort(key=lambda x: x[0], reverse=True)
 
     if len(fallback_clusters) > 0:
         top_clusters = [c for (_, c) in fallback_clusters[:num_cubes] if len(c.points) >= 40]
         if len(top_clusters) > 0:
-            return top_clusters, f"fallback: {len(top_clusters)} largest clusters"
+            return top_clusters, f"fallback: {len(top_clusters)} largest clusters", plane_np
 
-    return None, "no cluster passed filters"
+    return None, "no cluster passed filters", plane_np
 
 
-def cube_center_same_geometry(pts: numpy.ndarray, z_axis: numpy.ndarray, obb_center: numpy.ndarray) -> numpy.ndarray:
+def _signed_plane_dist(pts: numpy.ndarray, plane_model: numpy.ndarray) -> numpy.ndarray:
+    """Signed distance to plane ``ax+by+cz+d=0`` (Open3D convention)."""
+    a, b, c, d = plane_model[0], plane_model[1], plane_model[2], plane_model[3]
+    return pts[:, 0] * a + pts[:, 1] * b + pts[:, 2] * c + d
+
+
+def _project_points_to_plane(pts: numpy.ndarray, plane_model: numpy.ndarray) -> numpy.ndarray:
+    """Orthogonal projection of points onto the plane."""
+    n = numpy.asarray(plane_model[:3], dtype=numpy.float64)
+    n = n / (numpy.linalg.norm(n) + 1e-12)
+    dist = _signed_plane_dist(pts, plane_model)
+    return pts - dist[:, None] * n[None, :]
+
+
+def _in_plane_basis(n: numpy.ndarray) -> tuple[numpy.ndarray, numpy.ndarray]:
+    """Orthonormal e1, e2 spanning the table plane."""
+    tmp = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float64)
+    if abs(float(numpy.dot(tmp, n))) > 0.9:
+        tmp = numpy.array([0.0, 1.0, 0.0], dtype=numpy.float64)
+    e1 = numpy.cross(n, tmp)
+    e1 = e1 / (numpy.linalg.norm(e1) + 1e-12)
+    e2 = numpy.cross(n, e1)
+    e2 = e2 / (numpy.linalg.norm(e2) + 1e-12)
+    return e1, e2
+
+
+def physical_cube_pose_from_points(
+    pts: numpy.ndarray,
+    plane_model: numpy.ndarray,
+    camera_pose: numpy.ndarray,
+) -> tuple[numpy.ndarray, numpy.ndarray] | None:
     """
-    Estimate cube center using identical cube geometry: symmetric extent along ``z_axis``,
-    robust in-plane median, optional light OBB blend.
+    Cube on table: bottom-face footprint + known edge length + min-area yaw + bound centering.
 
-    ``z_axis`` is unit **up** (robot +Z in camera frame). Points are one cube cluster in meters.
+    Returns
+    -------
+    (t_robot_cube, t_cam_cube) or None.
     """
-    z_axis = z_axis / (numpy.linalg.norm(z_axis) + 1e-12)
-    p0 = numpy.median(pts, axis=0)
-    # Signed offsets along up from median reference
-    s = numpy.dot(pts - p0[None, :], z_axis)
-    s_lo = float(numpy.min(s))
-    s_hi = float(numpy.max(s))
-    s_mid = 0.5 * (s_lo + s_hi)
+    if pts.shape[0] < 30:
+        return None
 
-    # In-plane residual from p0 (perpendicular to z_axis)
-    tang = pts - p0[None, :] - numpy.outer(s, z_axis)
-    tang_med = numpy.median(tang, axis=0)
+    pm = numpy.asarray(plane_model, dtype=numpy.float64).copy()
+    R_cam_robot = camera_pose[:3, :3]
+    z_robot = R_cam_robot @ numpy.array([0.0, 0.0, 1.0], dtype=numpy.float64)
+    z_robot = z_robot / (numpy.linalg.norm(z_robot) + 1e-12)
+    if float(numpy.dot(pm[:3], z_robot)) < 0.0:
+        pm = -pm
 
-    geom = p0 + s_mid * z_axis + tang_med
+    n = pm[:3] / (numpy.linalg.norm(pm[:3]) + 1e-12)
+    e1, e2 = _in_plane_basis(n)
 
-    # Optional: if vertical span is wildly wrong, lean more on median (sensor junk)
-    span = s_hi - s_lo
-    if span > 1.8 * CUBE_SIZE_M or span < 0.4 * CUBE_SIZE_M:
-        geom = 0.6 * geom + 0.4 * p0
+    # Signed height above plane (consistent with flipped ``pm``)
+    h = _signed_plane_dist(pts, pm)
 
-    out = (1.0 - OBB_CENTER_BLEND) * geom + OBB_CENTER_BLEND * numpy.asarray(obb_center, dtype=numpy.float64)
-    return out.astype(numpy.float64)
+    h_min = float(numpy.min(h))
+    h_max = float(numpy.max(h))
+    span = h_max - h_min
+    if span < 1e-6:
+        return None
+
+    # Bottom face: points closest to the table (reduces forward / perspective bias)
+    thresh = h_min + BOTTOM_LAYER_FRAC * span
+    bottom_mask = h <= thresh
+    if int(numpy.sum(bottom_mask)) < 8:
+        thresh = numpy.percentile(h, 18.0)
+        bottom_mask = h <= thresh
+    if int(numpy.sum(bottom_mask)) < 5:
+        bottom_mask = numpy.ones(pts.shape[0], dtype=bool)
+
+    p_plane_all = _project_points_to_plane(pts, pm)
+    p_bot = p_plane_all[bottom_mask]
+
+    c_bottom = numpy.median(p_bot, axis=0)
+    # Cube center: half edge along table normal from bottom face center
+    center = c_bottom + (CUBE_SIZE_M * 0.5) * n
+
+    # Yaw: min-area rectangle on bottom footprint in (u,v)
+    rel = p_bot - c_bottom[None, :]
+    u = numpy.dot(rel, e1)
+    v = numpy.dot(rel, e2)
+    uv = numpy.stack([u, v], axis=1).astype(numpy.float32)
+    if uv.shape[0] >= 5:
+        rect = cv2.minAreaRect(uv)
+        box = cv2.boxPoints(rect).astype(numpy.float64)
+        e01 = box[1] - box[0]
+        norm_e = float(numpy.linalg.norm(e01))
+        if norm_e > 1e-9:
+            du, dv = e01[0] / norm_e, e01[1] / norm_e
+            x_axis = du * e1 + dv * e2
+        else:
+            x_axis = e1
+    else:
+        x_axis = e1
+
+    x_axis = x_axis - numpy.dot(x_axis, n) * n
+    x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
+    y_axis = numpy.cross(n, x_axis)
+    y_axis = y_axis / (numpy.linalg.norm(y_axis) + 1e-12)
+
+    R = orthonormalize_rotation(numpy.column_stack([x_axis, y_axis, n]))
+
+    # Snap center so the cloud is centered in the cube frame (fixes systematic offset)
+    c = center.copy()
+    for _ in range(BOUND_CENTER_ITERS):
+        q = R.T @ (pts - c[None, :]).T
+        delta = numpy.array(
+            [0.5 * (float(numpy.min(q[k])) + float(numpy.max(q[k]))) for k in range(3)],
+            dtype=numpy.float64,
+        )
+        if float(numpy.linalg.norm(delta)) < 1e-7:
+            break
+        c = c + R @ delta
+
+    t_cam_cube = numpy.eye(4, dtype=numpy.float64)
+    t_cam_cube[:3, :3] = R
+    t_cam_cube[:3, 3] = c
+
+    t_robot_cam = numpy.linalg.inv(camera_pose)
+    t_robot_cube = t_robot_cam @ t_cam_cube
+    return (t_robot_cube, t_cam_cube)
 
 
-def get_cube_transform(cube_pcd, camera_pose):
+def get_cube_transform(cube_pcd, camera_pose, plane_model: numpy.ndarray | None):
     """
-    Robust cube center + fixed-up orientation.
+    Physical cube on table using ``plane_model`` from scene RANSAC.
 
-    Center: same-geometry estimate (mid-extent along robot-up + in-plane median), with a
-    small OBB blend — better than OBB center alone for identical cubes.
-
-    - Cube +Z is always **robot +Z** in the camera frame.
-    - Cube +X from first OBB axis with nonzero horizontal projection.
-    - Cube +Y = +Z × +X (right-handed).
+    If ``plane_model`` is missing, falls back to OBB-based pose (weaker).
     """
     if cube_pcd is None or len(cube_pcd.points) < 30:
         return None
 
-    obb = cube_pcd.get_oriented_bounding_box()
-    obb_center = numpy.asarray(obb.center, dtype=numpy.float64)
     pts = numpy.asarray(cube_pcd.points, dtype=numpy.float64)
-    R_raw = numpy.asarray(obb.R, dtype=numpy.float64)
 
+    if plane_model is not None and numpy.asarray(plane_model).shape[0] >= 4:
+        out = physical_cube_pose_from_points(pts, numpy.asarray(plane_model, dtype=numpy.float64), camera_pose)
+        if out is not None:
+            return out
+
+    # --- Fallback: no valid plane ---
+    obb = cube_pcd.get_oriented_bounding_box()
+    R_raw = numpy.asarray(obb.R, dtype=numpy.float64)
     R_cam_robot = camera_pose[:3, :3]
     z_axis = R_cam_robot @ numpy.array([0.0, 0.0, 1.0], dtype=numpy.float64)
     z_axis = z_axis / (numpy.linalg.norm(z_axis) + 1e-12)
-
-    center = cube_center_same_geometry(pts, z_axis, obb_center)
+    center = numpy.asarray(obb.center, dtype=numpy.float64)
 
     x_axis = None
     for k in range(3):
@@ -196,26 +302,20 @@ def get_cube_transform(cube_pcd, camera_pose):
         if nrm > 1e-6:
             x_axis = x_proj / nrm
             break
-
     if x_axis is None:
         tmp = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float64)
         if abs(float(numpy.dot(tmp, z_axis))) > 0.9:
             tmp = numpy.array([0.0, 1.0, 0.0], dtype=numpy.float64)
         x_axis = tmp - numpy.dot(tmp, z_axis) * z_axis
         x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
-
     y_axis = numpy.cross(z_axis, x_axis)
     y_axis = y_axis / (numpy.linalg.norm(y_axis) + 1e-12)
-
     R = orthonormalize_rotation(numpy.column_stack([x_axis, y_axis, z_axis]))
-
     t_cam_cube = numpy.eye(4, dtype=numpy.float64)
     t_cam_cube[:3, :3] = R
     t_cam_cube[:3, 3] = center
-
     t_robot_cam = numpy.linalg.inv(camera_pose)
     t_robot_cube = t_robot_cam @ t_cam_cube
-
     return (t_robot_cube, t_cam_cube)
 
 
@@ -246,13 +346,13 @@ def get_cube_transforms(observation, camera_intrinsic, camera_pose):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(valid_points_m)
 
-    cube_pcds, _msg = isolate_cube_cluster_open3d(pcd, num_cubes=STACK_HEIGHT_GOAL)
+    cube_pcds, _msg, plane_np = isolate_cube_cluster_open3d(pcd, num_cubes=STACK_HEIGHT_GOAL)
     if cube_pcds is None:
         return None
 
     transforms = []
     for pcd_c in cube_pcds:
-        transforms.append(get_cube_transform(pcd_c, camera_pose))
+        transforms.append(get_cube_transform(pcd_c, camera_pose, plane_np))
 
     return transforms
 
@@ -311,7 +411,7 @@ def run_pure_vision_perception(cv_image, point_cloud, camera_intrinsic):
             draw_pose_axes(disp, camera_intrinsic, t_cam_cube)
 
     lines = [
-        "orientation_RRC: same-geometry center + Z-up + OBB face X",
+        "orientation_RRC: table plane + bottom face + min-rect yaw + bound snap",
     ]
     disp = draw_status_overlay(disp, lines, (0, 220, 0))
     return cube_transforms, disp
