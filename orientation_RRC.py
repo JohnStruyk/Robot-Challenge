@@ -435,7 +435,7 @@ def main():
     arm.set_mode(0)
     arm.set_state(0)
     arm.move_gohome(wait=True)
-    time.sleep(0.5)
+    time.sleep(0.15)
 
     try:
         cv_image = zed.image
@@ -496,7 +496,7 @@ def main():
     finally:
         arm.stop_lite6_gripper()
         arm.move_gohome(wait=True)
-        time.sleep(0.5)
+        time.sleep(0.15)
         arm.disconnect()
         zed.close()
         cv2.destroyAllWindows()
