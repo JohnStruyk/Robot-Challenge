@@ -8,8 +8,9 @@ Assumes each object is a **cube with one face flush on the table** (any yaw).
 - **Bottom face**: points closest to the table (lowest height percentiles) define
   the **contact footprint** — this reduces depth / “too far forward” bias from
   using the whole cloud or OBB center.
-- **Center** = center of bottom face on the plane + ``(CUBE_SIZE/2) * n``, then a
-  small **bound-centering** step in the fitted cube frame so the point cloud is
+- **Center** = center of bottom face on the plane + ``(CUBE_SIZE_M/2) * n`` (challenge
+  1 uses **25 mm** medium cubes; see ``CUBE_SIZE_SMALL_M`` / ``*_MEDIUM`` / ``*_LARGE``),
+  then a small **bound-centering** step in the fitted cube frame so the point cloud is
   symmetric in ``[-s/2,s/2]^3``.
 - **Yaw** from ``cv2.minAreaRect`` on the bottom-face footprint in the table plane.
 
@@ -38,7 +39,13 @@ from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 from utils.vis_utils import draw_pose_axes
 from utils.zed_camera import ZedCamera
 
-CUBE_SIZE_M = 0.025
+# Nominal cube edge lengths (meters) — physical inventory
+CUBE_SIZE_SMALL_M = 0.0225  # 22.5 mm
+CUBE_SIZE_MEDIUM_M = 0.025  # 25 mm
+CUBE_SIZE_LARGE_M = 0.030  # 30 mm
+# Challenge 1 (standard tower) uses medium (25 mm) cubes
+CUBE_SIZE_M = CUBE_SIZE_MEDIUM_M
+
 STACK_HEIGHT_GOAL = 12
 # Bottom-face layer: fraction of height range used to approximate the face on the table
 BOTTOM_LAYER_FRAC = 0.22
