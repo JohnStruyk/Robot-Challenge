@@ -1,10 +1,10 @@
 """
 orientation_RRC — checkpoint22 segmentation + upright cube frames.
 
-Uses the same clustering and OBB center as ``checkpoint22.py``. Orientation is
-forced so every cube has **+Z aligned with robot +Z** (up) in camera coordinates,
-**X** from the first usable OBB axis projected into the horizontal plane (one
-face/edge direction), and **Y = Z × X** for a right-handed cube frame.
+Uses the same clustering as ``checkpoint22.py``. The **center** uses identical-cube
+geometry: midpoint of extent along robot-up plus robust in-plane median (with a
+small OBB blend). Orientation forces **+Z = robot +Z** in camera frame, **+X**
+from the first usable horizontal OBB axis, **+Y = Z × X**.
 
 Run from any working directory: project root is added to ``sys.path`` so
 ``utils.zed_camera`` and checkpoints resolve.
@@ -33,6 +33,8 @@ from utils.zed_camera import ZedCamera
 
 CUBE_SIZE_M = 0.025
 STACK_HEIGHT_GOAL = 12
+# Blend robust geometric center with OBB (same-size cubes: median + extent beats OBB alone)
+OBB_CENTER_BLEND = 0.12
 
 
 def orthonormalize_rotation(R: numpy.ndarray) -> numpy.ndarray:
@@ -131,25 +133,60 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
     return None, "no cluster passed filters"
 
 
+def cube_center_same_geometry(pts: numpy.ndarray, z_axis: numpy.ndarray, obb_center: numpy.ndarray) -> numpy.ndarray:
+    """
+    Estimate cube center using identical cube geometry: symmetric extent along ``z_axis``,
+    robust in-plane median, optional light OBB blend.
+
+    ``z_axis`` is unit **up** (robot +Z in camera frame). Points are one cube cluster in meters.
+    """
+    z_axis = z_axis / (numpy.linalg.norm(z_axis) + 1e-12)
+    p0 = numpy.median(pts, axis=0)
+    # Signed offsets along up from median reference
+    s = numpy.dot(pts - p0[None, :], z_axis)
+    s_lo = float(numpy.min(s))
+    s_hi = float(numpy.max(s))
+    s_mid = 0.5 * (s_lo + s_hi)
+
+    # In-plane residual from p0 (perpendicular to z_axis)
+    tang = pts - p0[None, :] - numpy.outer(s, z_axis)
+    tang_med = numpy.median(tang, axis=0)
+
+    geom = p0 + s_mid * z_axis + tang_med
+
+    # Optional: if vertical span is wildly wrong, lean more on median (sensor junk)
+    span = s_hi - s_lo
+    if span > 1.8 * CUBE_SIZE_M or span < 0.4 * CUBE_SIZE_M:
+        geom = 0.6 * geom + 0.4 * p0
+
+    out = (1.0 - OBB_CENTER_BLEND) * geom + OBB_CENTER_BLEND * numpy.asarray(obb_center, dtype=numpy.float64)
+    return out.astype(numpy.float64)
+
+
 def get_cube_transform(cube_pcd, camera_pose):
     """
-    OBB center (checkpoint22) + fixed-up orientation.
+    Robust cube center + fixed-up orientation.
 
-    - Cube +Z is always **robot +Z** expressed in the camera frame (vertical).
-    - Cube +X is the first OBB axis that projects to a nonzero horizontal direction
-      (picks one face / edge in the table plane).
-    - Cube +Y = +Z × +X (right-handed cube).
+    Center: same-geometry estimate (mid-extent along robot-up + in-plane median), with a
+    small OBB blend — better than OBB center alone for identical cubes.
+
+    - Cube +Z is always **robot +Z** in the camera frame.
+    - Cube +X from first OBB axis with nonzero horizontal projection.
+    - Cube +Y = +Z × +X (right-handed).
     """
     if cube_pcd is None or len(cube_pcd.points) < 30:
         return None
 
     obb = cube_pcd.get_oriented_bounding_box()
-    center = numpy.asarray(obb.center, dtype=numpy.float64)
+    obb_center = numpy.asarray(obb.center, dtype=numpy.float64)
+    pts = numpy.asarray(cube_pcd.points, dtype=numpy.float64)
     R_raw = numpy.asarray(obb.R, dtype=numpy.float64)
 
     R_cam_robot = camera_pose[:3, :3]
     z_axis = R_cam_robot @ numpy.array([0.0, 0.0, 1.0], dtype=numpy.float64)
     z_axis = z_axis / (numpy.linalg.norm(z_axis) + 1e-12)
+
+    center = cube_center_same_geometry(pts, z_axis, obb_center)
 
     x_axis = None
     for k in range(3):
@@ -274,7 +311,7 @@ def run_pure_vision_perception(cv_image, point_cloud, camera_intrinsic):
             draw_pose_axes(disp, camera_intrinsic, t_cam_cube)
 
     lines = [
-        "orientation_RRC: checkpoint22 clusters + Z-up (robot +Z) + OBB face X",
+        "orientation_RRC: same-geometry center + Z-up + OBB face X",
     ]
     disp = draw_status_overlay(disp, lines, (0, 220, 0))
     return cube_transforms, disp
