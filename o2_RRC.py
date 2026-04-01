@@ -8,6 +8,10 @@ estimated then **snapped** to the nearest nominal size (**22.5 mm** / **25 mm** 
 **30 mm**). Challenge 1 uses 25 mm cubes; challenge 2 may mix sizes (see
 ``orientation_RRC.CUBE_SIZE_*_M``).
 
+Stack **XY** is fixed (``TOWER_X_M`` / ``TOWER_Y_M``); **Z** grows from the table
+surface upward by each cube’s snapped edge length. Placement uses a slower final
+descent and longer release dwell.
+
 Run: ``python o2_RRC.py`` (working directory arbitrary; project root on ``sys.path``).
 """
 from __future__ import annotations
@@ -46,11 +50,17 @@ from utils.vis_utils import draw_pose_axes
 from utils.zed_camera import ZedCamera
 
 ########################################################
+# Fixed tower location in robot frame (meters) — tune for your arena / stage
+TOWER_X_M = 0.370
+TOWER_Y_M = 0.020
+
+########################################################
 # Motion / clearance (aligned with fast_RRC2)
 
 GRASP_Z_OFFSET = 0.0001
 LIFT_Z_DELTA = 0.04
-PLACE_Z_OFFSET = 0.002
+# Slightly thicker offset so the TCP does not crash through the top cube
+PLACE_Z_OFFSET = 0.003
 TOOL_ROLL_DEG = 180.0
 TOOL_PITCH_DEG = 0.0
 
@@ -60,10 +70,14 @@ SAFE_Z_MIN_M = 0.10
 SAFE_Z_MAX_M = 0.36
 
 ARM_SPEED_FAST = 2200
-ARM_SPEED_PLACE = 180
-ARM_SPEED_LIFT = 2000
+ARM_SPEED_APPROACH = 450
+ARM_SPEED_PLACE_FINAL = 85
+ARM_SPEED_LIFT = 1800
 GRIPPER_SETTLE_GRASP_S = 0.35
-GRIPPER_SETTLE_PLACE_S = 0.45
+GRIPPER_SETTLE_PLACE_S = 0.55
+RELEASE_WAIT_S = 0.55
+# Last millimeters of descent at ARM_SPEED_PLACE_FINAL (mm above nominal place height)
+PLACE_SOFT_LAST_MM = 7.0
 
 # Nominal cube edges (same as orientation_RRC); stack / clearance use largest for margins
 CUBE_SIZES_M = (CUBE_SIZE_SMALL_M, CUBE_SIZE_MEDIUM_M, CUBE_SIZE_LARGE_M)
@@ -341,6 +355,10 @@ def grasp_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
 
 
 def place_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
+    """
+    Place at ``cube_pose`` XY/Z with a softer landing: approach fast, slow last
+    millimeters, then dwell after opening the gripper.
+    """
     xyz = cube_pose[:3, 3]
     x_mm, y_mm, z_mm = (xyz * 1000.0).tolist()
     z_c_m = float(xyz[2])
@@ -352,15 +370,23 @@ def place_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
     _, _, cube_yaw_deg = cube_r.as_euler("xyz", degrees=True)
 
     set_line(arm, x_mm, y_mm, safe_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
-    set_line(arm, x_mm, y_mm, place_z_mm, cube_yaw_deg, ARM_SPEED_PLACE)
+    # Descend most of the way at moderate speed
+    pre_touch_mm = place_z_mm - PLACE_SOFT_LAST_MM
+    if pre_touch_mm > safe_z_mm + 0.5:
+        set_line(arm, x_mm, y_mm, pre_touch_mm, cube_yaw_deg, ARM_SPEED_APPROACH)
+    set_line(arm, x_mm, y_mm, place_z_mm, cube_yaw_deg, ARM_SPEED_PLACE_FINAL)
     arm.open_lite6_gripper()
     time.sleep(GRIPPER_SETTLE_PLACE_S)
+    time.sleep(RELEASE_WAIT_S)
     set_line(arm, x_mm, y_mm, lift_z_mm, cube_yaw_deg, ARM_SPEED_LIFT)
 
 
-def apply_delta_z_to_pose(t_pose, delta_z_m):
-    out = numpy.copy(t_pose)
-    out[2, 3] += delta_z_m
+def stack_target_pose(source_pose: numpy.ndarray, tower_x_m: float, tower_y_m: float, z_center_m: float) -> numpy.ndarray:
+    """Build place pose: fixed tower XY, given stack center height; keep orientation from grasp."""
+    out = numpy.copy(source_pose)
+    out[0, 3] = float(tower_x_m)
+    out[1, 3] = float(tower_y_m)
+    out[2, 3] = float(z_center_m)
     return out
 
 
@@ -430,7 +456,10 @@ def run_challenge_o2_irregular(
 
     placed = 0
     start = time.time()
-    current_top_z: float | None = None
+    # z of table surface near the work area (initialized from first grasp)
+    table_z_m: float | None = None
+    # z of top face of the stack at TOWER_X_M, TOWER_Y_M (starts at table)
+    tower_top_z_m: float | None = None
 
     for _ in range(max_cubes):
         if time.time() - start > time_limit_s:
@@ -457,21 +486,24 @@ def run_challenge_o2_irregular(
         h_m = float(pick["edge_m"])
         z_c = float(t_src[2, 3])
 
-        if current_top_z is None:
-            current_top_z = z_c + h_m / 2.0
+        if table_z_m is None:
+            # Cube sitting on table: center ≈ table + h/2
+            table_z_m = z_c - h_m / 2.0
+            tower_top_z_m = float(table_z_m)
 
-        desired_center_z = current_top_z + h_m / 2.0
-        delta_z = desired_center_z - z_c
-        t_tgt = apply_delta_z_to_pose(t_src, delta_z)
+        # Next cube center sits half an edge above the current stack top surface
+        desired_center_z = float(tower_top_z_m) + h_m / 2.0
+        t_tgt = stack_target_pose(t_src, TOWER_X_M, TOWER_Y_M, desired_center_z)
 
-        tower_top_z_m = float(current_top_z)
+        # Clearance uses stack top *before* this block is added
+        tower_top_for_motion = float(tower_top_z_m)
         h_grasp = max(h_m, REF_CUBE_HEIGHT_M)
 
         try:
-            grasp_cube(arm, t_src, tower_top_z_m, h_grasp)
-            place_cube(arm, t_tgt, tower_top_z_m, h_m)
+            grasp_cube(arm, t_src, tower_top_for_motion, h_grasp)
+            place_cube(arm, t_tgt, tower_top_for_motion, h_m)
             arm.stop_lite6_gripper()
-            current_top_z += h_m
+            tower_top_z_m = float(tower_top_z_m) + h_m
             placed += 1
         except Exception as exc:
             traceback.print_exc()
