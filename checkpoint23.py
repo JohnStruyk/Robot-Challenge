@@ -10,7 +10,7 @@ from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 from best_RRC1 import grasp_cube_fast, place_cube_fast
 
 CUBE_SIZE = 0.025
-STACK_HEIGHT_GOAL = 12
+STACK_HEIGHT_GOAL = 9
 
 
 

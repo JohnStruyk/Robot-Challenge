@@ -54,13 +54,13 @@ def grasp_cube(arm, cube_pose):
     time.sleep(0.3)
 
     # Approach -> descend -> grasp -> lift.
-    arm.set_position(x_mm, y_mm, approach_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=300)
-    arm.set_position(x_mm, y_mm, safe_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=300)
+    arm.set_position(x_mm, y_mm, approach_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=150)
+    arm.set_position(x_mm, y_mm, safe_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=150)
     arm.set_position(x_mm, y_mm, grasp_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=50)
     arm.close_lite6_gripper()
     #arm.stop_lite6_gripper()
     time.sleep(0.7)
-    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=300)
+    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=150)
 
 def place_cube(arm, cube_pose):
     """
@@ -86,12 +86,12 @@ def place_cube(arm, cube_pose):
     _, _, cube_yaw_deg = cube_r.as_euler('xyz', degrees=True)
 
 
-    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=300)
+    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=150)
     arm.set_position(x_mm, y_mm, place_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=50)
     arm.open_lite6_gripper()
     #arm.stop_lite6_gripper()
     time.sleep(0.3)
-    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=300)
+    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=150)
 
 def get_transform_cube(observation, camera_intrinsic, camera_pose):
     """

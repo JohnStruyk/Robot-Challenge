@@ -311,10 +311,10 @@ def main():
 
             for i in range(STACK_HEIGHT_GOAL):
                 t_robot_cube, _ = cube_transforms[i]
-                # grasp_cube(arm, t_robot_cube)
-                # place_cube(arm, t_robot_stack)
-                grasp_cube_fast(arm, t_robot_cube)
-                place_cube_fast(arm, t_robot_stack)
+                grasp_cube(arm, t_robot_cube)
+                place_cube(arm, t_robot_stack)
+                #grasp_cube_fast(arm, t_robot_cube)
+                #place_cube_fast(arm, t_robot_stack)
                 t_robot_stack[2, 3] += CUBE_SIZE
 
             arm.stop_lite6_gripper()
