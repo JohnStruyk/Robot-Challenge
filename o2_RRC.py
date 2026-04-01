@@ -3,8 +3,10 @@ o2_RRC — irregular skyscraper (challenge 2) with **adaptive cube size** and
 **largest-first** placement: each cycle picks the **biggest remaining** cube on
 the table for the next stack level (big cubes tend to form the base).
 
-Vision reuses ``orientation_RRC`` table plane + physical pose, with **per-cube
-edge length** estimated from height span + OBB extents (clamped).
+Vision reuses ``orientation_RRC`` table plane + physical pose. Edge length is
+estimated then **snapped** to the nearest nominal size (**22.5 mm** / **25 mm** /
+**30 mm**). Challenge 1 uses 25 mm cubes; challenge 2 may mix sizes (see
+``orientation_RRC.CUBE_SIZE_*_M``).
 
 Run: ``python o2_RRC.py`` (working directory arbitrary; project root on ``sys.path``).
 """
@@ -30,6 +32,9 @@ from checkpoint1 import GRIPPER_LENGTH, robot_ip
 from orientation_RRC import (
     BOUND_CENTER_ITERS,
     BOTTOM_LAYER_FRAC,
+    CUBE_SIZE_LARGE_M,
+    CUBE_SIZE_MEDIUM_M,
+    CUBE_SIZE_SMALL_M,
     isolate_cube_cluster_open3d,
     orthonormalize_rotation,
     points_to_meters_open3d,
@@ -60,14 +65,21 @@ ARM_SPEED_LIFT = 2000
 GRIPPER_SETTLE_GRASP_S = 0.35
 GRIPPER_SETTLE_PLACE_S = 0.45
 
-# Adaptive edge bounds (meters) — physical cubes in arena
-EDGE_MIN_M = 0.014
-EDGE_MAX_M = 0.095
-REF_CUBE_HEIGHT_M = 0.03
+# Nominal cube edges (same as orientation_RRC); stack / clearance use largest for margins
+CUBE_SIZES_M = (CUBE_SIZE_SMALL_M, CUBE_SIZE_MEDIUM_M, CUBE_SIZE_LARGE_M)
+# Clamp raw estimate before snapping (meters), just outside 22.5–30 mm
+EDGE_MIN_M = 0.021
+EDGE_MAX_M = 0.032
+REF_CUBE_HEIGHT_M = CUBE_SIZE_LARGE_M  # 30 mm — worst-case safe clearance
 
 MAX_CLUSTERS = 14
 POSE_SAMPLES = 2
 POSE_SAMPLE_DT_S = 0.05
+
+
+def snap_edge_to_nominal(edge_m: float) -> float:
+    """Map a noisy edge estimate to the closest of 22.5 / 25 / 30 mm."""
+    return min(CUBE_SIZES_M, key=lambda s: abs(float(s) - float(edge_m)))
 
 
 def flip_plane_to_robot_up(plane_model: numpy.ndarray, camera_pose: numpy.ndarray) -> numpy.ndarray:
@@ -87,7 +99,7 @@ def estimate_cube_edge_m(
     camera_pose: numpy.ndarray,
 ) -> float:
     """
-    Adaptive edge length: blend vertical span (cube on table) with OBB median edge.
+    Blend vertical span with OBB median edge, clamp, then snap to 22.5 / 25 / 30 mm.
     """
     pm = flip_plane_to_robot_up(plane_model, camera_pose)
     h = _signed_plane_dist(pts, pm)
@@ -98,7 +110,8 @@ def estimate_cube_edge_m(
     ext = numpy.sort(numpy.asarray(obb.extent))
     med_edge = float(numpy.median(ext))
     edge = 0.52 * span_v + 0.48 * med_edge
-    return float(numpy.clip(edge, EDGE_MIN_M, EDGE_MAX_M))
+    edge = float(numpy.clip(edge, EDGE_MIN_M, EDGE_MAX_M))
+    return snap_edge_to_nominal(edge)
 
 
 def physical_cube_pose_with_edge(
