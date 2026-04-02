@@ -411,7 +411,7 @@ def run_pure_vision_perception(cv_image, point_cloud, camera_intrinsic):
 
     lines = [
         status,
-        "play mat crop + Z band; poses filtered to mat centers",
+        "play mat crop + Z band; run: base=large #0, stack mid+small, then 2 large",
     ]
     disp = cv_image.copy()
     for transform in cube_transforms:
@@ -420,6 +420,14 @@ def run_pure_vision_perception(cv_image, point_cloud, camera_intrinsic):
             draw_pose_axes(disp, camera_intrinsic, t_cam_cube)
     disp = draw_status_overlay(disp, lines, (0, 220, 0))
     return cube_transforms, disp
+
+
+def stack_target_pose(source_pose: numpy.ndarray, x_m: float, y_m: float, z_center_m: float) -> numpy.ndarray:
+    out = numpy.copy(source_pose)
+    out[0, 3] = float(x_m)
+    out[1, 3] = float(y_m)
+    out[2, 3] = float(z_center_m)
+    return out
 
 
 def main():
@@ -458,42 +466,43 @@ def main():
             cv2.destroyAllWindows()
             return
 
-        t_robot_cube, _t_cam_cube = cube_transforms[0]
+        # Sorted largest→smallest: indices 0–2 = large, 3–5 = medium, 6–8 = small.
+        t_base, _t_cam_base = cube_transforms[0]
 
-        if key == ord("k") and t_robot_cube is not None:
+        if key == ord("k") and t_base is not None:
             cv2.destroyAllWindows()
-            xyz = t_robot_cube[:3, 3]
+            bx, by, bz = (float(t_base[0, 3]), float(t_base[1, 3]), float(t_base[2, 3]))
             print(
-                f"Cube in robot frame (m): x={xyz[0]:.3f}, y={xyz[1]:.3f}, z={xyz[2]:.3f}"
+                f"Base (largest) cube at robot (m): x={bx:.3f}, y={by:.3f}, z={bz:.3f} — not grasped first."
+            )
+            print(
+                "Stacking 3× medium + 3× small on that base, then grasping the other 2 large cubes onto the tower."
             )
 
-            X_FIXED = 0.370
-            Y_FIXED = 0.020
+            # Top face of the unmoved base cube (next block sits centered above this Z).
+            tower_top_z_m = bz + 0.5 * BIG_CUBE_SIZE
 
-            # Copy the detected transform
-            t_robot_stack = t_robot_cube.copy()
+            def place_on_stack(t_src_robot: numpy.ndarray, edge_m: float) -> None:
+                nonlocal tower_top_z_m
+                z_center = tower_top_z_m + 0.5 * edge_m
+                t_place = stack_target_pose(t_src_robot, bx, by, z_center)
+                grasp_cube(arm, t_src_robot)
+                place_cube(arm, t_place)
+                tower_top_z_m += edge_m
 
-            # Overwrite only X and Y
-            t_robot_stack[0, 3] = X_FIXED
-            t_robot_stack[1, 3] = Y_FIXED
-
-            for i in range(BIG_CUBES_GOAL):
-                t_robot_cube, _ = cube_transforms[i]
-                grasp_cube(arm, t_robot_cube)
-                place_cube(arm, t_robot_stack)
-                t_robot_stack[2, 3] += BIG_CUBE_SIZE
-            
+            # Medium, then small — never touch the three large picks yet (except base, untouched).
             for i in range(BIG_CUBES_GOAL, BIG_CUBES_GOAL + MID_CUBES_GOAL):
                 t_robot_cube, _ = cube_transforms[i]
-                grasp_cube(arm, t_robot_cube)
-                place_cube(arm, t_robot_stack)
-                t_robot_stack[2, 3] += MID_CUBE_SIZE
+                place_on_stack(t_robot_cube, MID_CUBE_SIZE)
 
-            for i in range(BIG_CUBES_GOAL + MID_CUBES_GOAL, BIG_CUBES_GOAL + MID_CUBES_GOAL + LIL_CUBES_GOAL):
+            for i in range(BIG_CUBES_GOAL + MID_CUBES_GOAL, STACK_HEIGHT_GOAL):
                 t_robot_cube, _ = cube_transforms[i]
-                grasp_cube(arm, t_robot_cube)
-                place_cube(arm, t_robot_stack)
-                t_robot_stack[2, 3] += LIL_CUBE_SIZE
+                place_on_stack(t_robot_cube, LIL_CUBE_SIZE)
+
+            # Remaining two 30 mm cubes (indices 1 and 2) onto the top last.
+            for i in (1, 2):
+                t_robot_cube, _ = cube_transforms[i]
+                place_on_stack(t_robot_cube, BIG_CUBE_SIZE)
 
             arm.stop_lite6_gripper()
         else:
