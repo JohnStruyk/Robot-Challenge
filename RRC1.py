@@ -10,6 +10,7 @@ from scipy.spatial.transform import Rotation
 from xarm.wrapper import XArmAPI
 
 from utils.zed_camera import ZedCamera
+from checkpoint1 import grasp_cube, place_cube
 
 
 ################################################################### Constants
@@ -190,106 +191,7 @@ def detect_cube_pose_unified(observation, camera_intrinsic, t_cam_robot):
 
 
 #################################################################### Manipulation
-
-def grasp_cube(arm, cube_pose):
-    """Move to the cube, close the gripper, and lift up.
-
-    Inputs: arm — xArm API; cube_pose — 4x4 pose of the cube in robot frame (meters).
-    Outputs: none (moves the robot).
-    """
-    xyz = cube_pose[:3, 3]
-    x_mm, y_mm, z_mm = (xyz * 1000.0).tolist()
-    safe_z_mm = SAFE_Z * 1000.0
-    grasp_z_mm = z_mm + (GRASP_Z_OFFSET * 1000.0)
-    lift_z_mm = max(safe_z_mm, grasp_z_mm + (LIFT_Z_DELTA * 1000.0))
-
-    cube_r = Rotation.from_matrix(cube_pose[:3, :3])
-    _, _, cube_yaw_deg = cube_r.as_euler("xyz", degrees=True)
-
-    arm.open_lite6_gripper()
-    time.sleep(1)
-
-    arm.set_position(
-        x_mm,
-        y_mm,
-        safe_z_mm,
-        TOOL_ROLL_DEG,
-        TOOL_PITCH_DEG,
-        cube_yaw_deg,
-        is_radian=False,
-        wait=True,
-    )
-    arm.set_position(
-        x_mm,
-        y_mm,
-        grasp_z_mm,
-        TOOL_ROLL_DEG,
-        TOOL_PITCH_DEG,
-        cube_yaw_deg,
-        is_radian=False,
-        wait=True,
-    )
-    arm.close_lite6_gripper()
-    time.sleep(1)
-    arm.set_position(
-        x_mm,
-        y_mm,
-        lift_z_mm,
-        TOOL_ROLL_DEG,
-        TOOL_PITCH_DEG,
-        cube_yaw_deg,
-        is_radian=False,
-        wait=True,
-    )
-
-
-def place_cube(arm, cube_pose):
-    """Move above the drop pose, place the cube, open gripper, and lift away.
-
-    Inputs: arm — xArm API; cube_pose — 4x4 target pose in robot frame (meters).
-    Outputs: none (moves the robot).
-    """
-    xyz = cube_pose[:3, 3]
-    x_mm, y_mm, z_mm = (xyz * 1000.0).tolist()
-    safe_z_mm = SAFE_Z * 1000.0
-    place_z_mm = z_mm + (PLACE_Z_OFFSET * 1000.0)
-    lift_z_mm = max(safe_z_mm, place_z_mm + (LIFT_Z_DELTA * 1000.0))
-
-    cube_r = Rotation.from_matrix(cube_pose[:3, :3])
-    _, _, cube_yaw_deg = cube_r.as_euler("xyz", degrees=True)
-
-    arm.set_position(
-        x_mm,
-        y_mm,
-        safe_z_mm,
-        TOOL_ROLL_DEG,
-        TOOL_PITCH_DEG,
-        cube_yaw_deg,
-        is_radian=False,
-        wait=True,
-    )
-    arm.set_position(
-        x_mm,
-        y_mm,
-        place_z_mm,
-        TOOL_ROLL_DEG,
-        TOOL_PITCH_DEG,
-        cube_yaw_deg,
-        is_radian=False,
-        wait=True,
-    )
-    arm.open_lite6_gripper()
-    time.sleep(1)
-    arm.set_position(
-        x_mm,
-        y_mm,
-        lift_z_mm,
-        TOOL_ROLL_DEG,
-        TOOL_PITCH_DEG,
-        cube_yaw_deg,
-        is_radian=False,
-        wait=True,
-    )
+# grasp_cube / place_cube: imported from checkpoint1 (fast travel + short gripper dwell).
 
 
 def make_standard_tower_target_pose(base_pose, stack_index):
@@ -450,7 +352,7 @@ def run_challenge_standard_tower(
             print("Motion error:", exc)
             break
 
-    time.sleep(0.5)
+    time.sleep(0.15)
     return placed
 
 
@@ -464,7 +366,7 @@ def main():
     arm.set_mode(0)
     arm.set_state(0)
     arm.move_gohome(wait=True)
-    time.sleep(0.5)
+    time.sleep(0.15)
 
     try:
         n = run_challenge_standard_tower(
@@ -478,7 +380,7 @@ def main():
     finally:
         arm.stop_lite6_gripper()
         arm.move_gohome(wait=True)
-        time.sleep(0.5)
+        time.sleep(0.15)
         arm.disconnect()
         zed.close()
         cv2.destroyAllWindows()

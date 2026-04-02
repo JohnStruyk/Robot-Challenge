@@ -12,14 +12,22 @@ CUBE_TAG_FAMILY = 'tag36h11'
 CUBE_TAG_ID = 4
 CUBE_TAG_SIZE = 0.02
 
-robot_ip = '192.168.1.159'
+robot_ip = '192.168.1.182'
 
 # Motion constants (meters / degrees)
-APPROACH_Z = 0.15
-SAFE_Z = 0.055
-GRASP_Z_OFFSET = 0.003
-LIFT_Z_DELTA = 0.04
-PLACE_Z_OFFSET = 0.01
+SAFE_Z = 0.22
+GRASP_Z_OFFSET = 0.0001
+LIFT_Z_DELTA = 0.06
+PLACE_Z_OFFSET = 0.002
+
+# Cartesian speed (mm/s) — higher = less time between waypoints (still waits for motion to finish).
+ARM_SPEED_TRAVEL_MM_S = 3200
+ARM_SPEED_PLACE_DESCEND_MM_S = 900
+
+# Gripper settle (seconds) — shorter than legacy 1.0s; increase if grasp is unreliable.
+GRIPPER_SETTLE_AFTER_OPEN_S = 0.18
+GRIPPER_SETTLE_AFTER_CLOSE_S = 0.20
+GRIPPER_SETTLE_AFTER_RELEASE_S = 0.24
 
 # Keep tool mostly vertical; only yaw is adapted from cube pose.
 TOOL_ROLL_DEG = 180.0
@@ -42,7 +50,6 @@ def grasp_cube(arm, cube_pose):
     safe_z_mm = SAFE_Z * 1000.0
     grasp_z_mm = z_mm + (GRASP_Z_OFFSET * 1000.0)
     lift_z_mm = max(safe_z_mm, grasp_z_mm + (LIFT_Z_DELTA * 1000.0))
-    approach_z_mm = APPROACH_Z * 1000
 
     # Align tool yaw with cube yaw so the parallel jaws are more likely to seat cleanly.
     cube_r = Rotation.from_matrix(cube_pose[:3, :3])
@@ -50,17 +57,23 @@ def grasp_cube(arm, cube_pose):
 
     # Ensure gripper is open before approach.
     arm.open_lite6_gripper()
-    #arm.stop_lite6_gripper()
-    time.sleep(0.3)
+    time.sleep(GRIPPER_SETTLE_AFTER_OPEN_S)
 
     # Approach -> descend -> grasp -> lift.
-    arm.set_position(x_mm, y_mm, approach_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=150)
-    arm.set_position(x_mm, y_mm, safe_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=150)
-    arm.set_position(x_mm, y_mm, grasp_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=50)
+    arm.set_position(
+        x_mm, y_mm, safe_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg,
+        speed=ARM_SPEED_TRAVEL_MM_S, is_radian=False, wait=True,
+    )
+    arm.set_position(
+        x_mm, y_mm, grasp_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg,
+        speed=ARM_SPEED_PLACE_DESCEND_MM_S, is_radian=False, wait=True,
+    )
     arm.close_lite6_gripper()
-    #arm.stop_lite6_gripper()
-    time.sleep(0.7)
-    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=150)
+    time.sleep(GRIPPER_SETTLE_AFTER_CLOSE_S)
+    arm.set_position(
+        x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg,
+        speed=ARM_SPEED_TRAVEL_MM_S, is_radian=False, wait=True,
+    )
 
 def place_cube(arm, cube_pose):
     """
@@ -80,18 +93,23 @@ def place_cube(arm, cube_pose):
     place_z_mm = z_mm + (PLACE_Z_OFFSET * 1000.0)
     lift_z_mm = max(safe_z_mm, place_z_mm + (LIFT_Z_DELTA * 1000.0))
 
-    lift_z_mm = place_z_mm + LIFT_Z_DELTA * 1000
-
     cube_r = Rotation.from_matrix(cube_pose[:3, :3])
     _, _, cube_yaw_deg = cube_r.as_euler('xyz', degrees=True)
 
-
-    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=150)
-    arm.set_position(x_mm, y_mm, place_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=50)
+    arm.set_position(
+        x_mm, y_mm, safe_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg,
+        speed=ARM_SPEED_TRAVEL_MM_S, is_radian=False, wait=True,
+    )
+    arm.set_position(
+        x_mm, y_mm, place_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg,
+        speed=ARM_SPEED_PLACE_DESCEND_MM_S, is_radian=False, wait=True,
+    )
     arm.open_lite6_gripper()
-    #arm.stop_lite6_gripper()
-    time.sleep(0.3)
-    arm.set_position(x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg, is_radian=False, wait=True, speed=150)
+    time.sleep(GRIPPER_SETTLE_AFTER_RELEASE_S)
+    arm.set_position(
+        x_mm, y_mm, lift_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg,
+        speed=ARM_SPEED_TRAVEL_MM_S, is_radian=False, wait=True,
+    )
 
 def get_transform_cube(observation, camera_intrinsic, camera_pose):
     """

@@ -49,8 +49,8 @@ CUBE_SIZE_M = CUBE_SIZE_MEDIUM_M
 STACK_HEIGHT_GOAL = 12
 # Bottom-face layer: fraction of height range used to approximate the face on the table
 BOTTOM_LAYER_FRAC = 0.22
-# Refinement: snap translation so AABB in cube frame matches cloud (1–2 passes)
-BOUND_CENTER_ITERS = 2
+# Refinement: snap translation so AABB in cube frame matches cloud
+BOUND_CENTER_ITERS = 4
 
 
 def orthonormalize_rotation(R: numpy.ndarray) -> numpy.ndarray:
@@ -185,9 +185,16 @@ def physical_cube_pose_from_points(
     pts: numpy.ndarray,
     plane_model: numpy.ndarray,
     camera_pose: numpy.ndarray,
+    edge_m: float | None = None,
 ) -> tuple[numpy.ndarray, numpy.ndarray] | None:
     """
     Cube on table: bottom-face footprint + known edge length + min-area yaw + bound centering.
+
+    Parameters
+    ----------
+    edge_m
+        Physical cube edge (m). Pass as 4th positional or ``edge_m=``. If ``None``, uses
+        ``CUBE_SIZE_M`` (25 mm challenge default).
 
     Returns
     -------
@@ -228,8 +235,9 @@ def physical_cube_pose_from_points(
     p_bot = p_plane_all[bottom_mask]
 
     c_bottom = numpy.median(p_bot, axis=0)
+    size_m = float(CUBE_SIZE_M if edge_m is None else edge_m)
     # Cube center: half edge along table normal from bottom face center
-    center = c_bottom + (CUBE_SIZE_M * 0.5) * n
+    center = c_bottom + (size_m * 0.5) * n
 
     # Yaw: min-area rectangle on bottom footprint in (u,v)
     rel = p_bot - c_bottom[None, :]
