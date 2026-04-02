@@ -87,7 +87,7 @@ class ZedCamera:
         # Warmup ZED Camera
         self._zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
         self._zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
-        for _ in range(50):
+        for _ in range(int(ZED_WARMUP_GRABS)):
             self._zed.grab(self._runtime_parameters)
 
         # Setup Explosure for Better Image Quality

@@ -82,15 +82,16 @@ ARM_SPEED_TRAVEL = 1200
 ARM_SPEED_APPROACH = 320
 ARM_SPEED_PLACE_FINAL = 70
 ARM_SPEED_LIFT = 1000
-# Grasp: slow at cube level (~35 mm gripper vs 30 mm cubes → need precise XY; keep ≥50).
-ARM_SPEED_GRASP_CUBE_LEVEL = 50
-ARM_SPEED_GRASP_DESCEND_FINAL = 50
-GRASP_FINAL_APPROACH_MM = 5.0
-GRIPPER_SETTLE_GRASP_S = 0.25
+# Grasp speeds (higher = faster moves at cube height).
+ARM_SPEED_GRASP_CUBE_LEVEL = 160
+ARM_SPEED_GRASP_DESCEND_FINAL = 140
+GRASP_FINAL_APPROACH_MM = 3.5
+GRIPPER_SETTLE_GRASP_S = 0.15
 GRIPPER_SETTLE_PLACE_S = 0.45
 RELEASE_WAIT_S = 0.45
 PLACE_SOFT_LAST_MM = 7.0
-GRASP_YAW_OFFSET_DEG = 0.0
+# Additive offset after snap-to-90° yaw (systematic ~45° cube horizontal frame vs gripper).
+GRASP_YAW_OFFSET_DEG = 45.0
 
 CUBE_SIZES_M = (CUBE_SIZE_SMALL_M, CUBE_SIZE_MEDIUM_M, CUBE_SIZE_LARGE_M)
 EDGE_MIN_M = 0.021
@@ -114,26 +115,29 @@ LARGE_DENSE_CROP_MARGIN_M = 0.012
 LARGE_CLUSTER_MIN_EXTENT_M = 0.027
 
 # Open3D ICP: synthetic cube mesh → measured cluster (camera frame, meters).
-ICP_MESH_SAMPLES = 2800
+ICP_MESH_SAMPLES = 1500
 ICP_VOXEL_M = 0.0025
 ICP_MAX_CORR_COARSE_M = 0.020
 ICP_MAX_CORR_FINE_M = 0.007
-ICP_COARSE_ITERS = 55
-ICP_FINE_ITERS = 45
+ICP_COARSE_ITERS = 32
+ICP_FINE_ITERS = 26
 ICP_MIN_FITNESS = 0.12
+# Fewer yaw hypotheses = faster; increase to 4 if ICP picks wrong 90° often.
+ICP_YAW_HYPOTHESIS_COUNT = 2
 
 # Pre-ICP physical init: single pipeline; ICP does the fine alignment.
-PHYSICAL_INIT_BOUND_EXTRA = 4
+PHYSICAL_INIT_BOUND_EXTRA = 2
 PHYSICAL_INIT_YAW_SOURCE = "bottom"
 # Extra AABB centering in cube frame after ICP + footprint blend (large cubes need tight XY).
-BOUND_CENTER_ITERS_AFTER_ICP_SMALL = 4
-BOUND_CENTER_ITERS_AFTER_ICP_MEDIUM = 6
-BOUND_CENTER_ITERS_AFTER_ICP_LARGE = 10
+BOUND_CENTER_ITERS_AFTER_ICP_SMALL = 2
+BOUND_CENTER_ITERS_AFTER_ICP_MEDIUM = 3
+BOUND_CENTER_ITERS_AFTER_ICP_LARGE = 5
 
 # Per-cluster plane refit (bottom points only) — more stable normal than global table RANSAC.
 CLUSTER_PLANE_BOTTOM_FRAC = 0.38
 CLUSTER_PLANE_RANSAC_DIST_M = 0.0022
 CLUSTER_PLANE_MIN_INLIER_FRAC = 0.22
+CLUSTER_PLANE_RANSAC_ITERS = 180
 
 
 def preprocess_scene_observation(
@@ -196,7 +200,7 @@ def refine_plane_from_cluster_bottom_points(
         plane_new, inliers = pcd.segment_plane(
             distance_threshold=CLUSTER_PLANE_RANSAC_DIST_M,
             ransac_n=3,
-            num_iterations=400,
+            num_iterations=int(CLUSTER_PLANE_RANSAC_ITERS),
         )
     except Exception:
         return numpy.asarray(plane_model, dtype=numpy.float64)
@@ -486,9 +490,9 @@ def _icp_tuning_for_edge(edge_m: float) -> tuple[float, float, int, int]:
     """(voxel_m, max_corr_fine_m, coarse_iters, fine_iters) — tighter for 30 mm (gripper margin)."""
     b = _nominal_edge_bucket(edge_m)
     if b == "large":
-        return 0.0018, 0.0045, 68, 58
+        return 0.0018, 0.0045, 38, 30
     if b == "small":
-        return 0.0030, 0.0080, 48, 38
+        return 0.0030, 0.0080, 28, 22
     return ICP_VOXEL_M, ICP_MAX_CORR_FINE_M, ICP_COARSE_ITERS, ICP_FINE_ITERS
 
 
@@ -760,7 +764,7 @@ def _icp_single_with_metrics(
     voxel_m, corr_fine_m, coarse_iters, fine_iters = _icp_tuning_for_edge(edge_m)
     mesh = o3d.geometry.TriangleMesh.create_box(em, em, em)
     mesh.translate(-numpy.array([em * 0.5, em * 0.5, em * 0.5], dtype=numpy.float64))
-    n_src = min(ICP_MESH_SAMPLES, max(500, int(pts_cam.shape[0] * 30)))
+    n_src = min(ICP_MESH_SAMPLES, max(400, int(pts_cam.shape[0] * 18)))
     source = mesh.sample_points_uniformly(number_of_points=n_src)
     target = o3d.geometry.PointCloud()
     target.points = o3d.utility.Vector3dVector(pts_cam.astype(numpy.float64))
@@ -830,15 +834,15 @@ def icp_refine_cube_pose_cam(
     edge_m: float,
 ) -> numpy.ndarray:
     """
-    Multi-hypothesis ICP: cube has 4-fold symmetry about vertical in top view; a single ICP
-    can settle in a wrong 90° local minimum. Try four 90° rotations about cube +Z in the
-    initial pose, keep the result with **lowest inlier RMSE** (then highest fitness).
+    Multi-hypothesis ICP: try ``ICP_YAW_HYPOTHESIS_COUNT`` rotations about cube +Z (90° steps),
+    keep **lowest inlier RMSE** (then highest fitness). Fewer hypotheses = faster.
     """
     T0 = numpy.asarray(t_cam_init, dtype=numpy.float64)
     R0 = T0[:3, :3].copy()
     best_T = T0
     best_key = (1e9, -1.0)
-    for k in range(4):
+    nh = max(1, min(4, int(ICP_YAW_HYPOTHESIS_COUNT)))
+    for k in range(nh):
         ang = k * (numpy.pi * 0.5)
         c, s = numpy.cos(ang), numpy.sin(ang)
         Rz = numpy.eye(3, dtype=numpy.float64)
