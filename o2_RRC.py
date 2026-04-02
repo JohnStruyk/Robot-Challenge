@@ -9,9 +9,11 @@ then **three small** (same tie-break).
 ``get_transform_camera_robot`` → ``T_cam_robot`` with **P_cam = T_cam_robot @ P_robot** (tag/world = robot
 frame). Cube pose ``T_cam_cube`` maps cube frame to camera. Then **T_robot_cube = inv(T_cam_robot) @ T_cam_cube**.
 
-**Perception**: Points cropped to the play mat; pose = physical init + ICP + footprint blend. Detections
-whose cube center **does not project into the current image** are rejected (avoids grasping to empty space
-when pose is inconsistent with the RGB view).
+**Perception**: Points cropped to the play mat. **Yaw** no longer comes from ``cv2.minAreaRect`` on a
+near-square footprint (that is ambiguous and often ~45° off). Instead: **per-cluster table plane**
+refit, **3D OBB** axes with cube **Z** pinned to the table normal, **multi-hypothesis ICP** (four 90°
+rotations around vertical to escape symmetric local minima), then footprint blend. Optional **CuPy**
+accelerates large point projections when installed.
 
 **Route**: Sort by **nominal** edge (not raw float), then −X. Match steps by nominal edge + nearest XY.
 **Grasp**: yaw snapped to 90°; no wiggle.
@@ -33,6 +35,14 @@ import cv2
 import numpy
 import open3d as o3d
 from scipy.spatial.transform import Rotation
+
+try:
+    import cupy as _cupy  # type: ignore
+
+    _CUPY_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    _cupy = None
+    _CUPY_AVAILABLE = False
 from xarm.wrapper import XArmAPI
 
 from checkpoint0 import TAG_CENTER_COORDINATES, get_transform_camera_robot
@@ -118,6 +128,135 @@ PHYSICAL_INIT_YAW_SOURCE = "bottom"
 BOUND_CENTER_ITERS_AFTER_ICP_SMALL = 4
 BOUND_CENTER_ITERS_AFTER_ICP_MEDIUM = 6
 BOUND_CENTER_ITERS_AFTER_ICP_LARGE = 10
+
+# Per-cluster plane refit (bottom points only) — more stable normal than global table RANSAC.
+CLUSTER_PLANE_BOTTOM_FRAC = 0.38
+CLUSTER_PLANE_RANSAC_DIST_M = 0.0022
+CLUSTER_PLANE_MIN_INLIER_FRAC = 0.22
+
+
+def preprocess_scene_observation(
+    image_bgra: numpy.ndarray | None,
+    pts_cam_m: numpy.ndarray,
+    camera_intrinsic: numpy.ndarray | None,
+) -> dict:
+    """
+    Up-front work: optional GPU depth statistics + blurred grayscale for downstream use.
+    Call once per frame before clustering when possible.
+    """
+    out: dict = {"cupy": _CUPY_AVAILABLE, "uv_stats": None}
+    if pts_cam_m.shape[0] < 1:
+        return out
+    if _CUPY_AVAILABLE and _cupy is not None and pts_cam_m.shape[0] > 80000:
+        try:
+            xp = _cupy
+            z = xp.asarray(pts_cam_m[:, 2], dtype=xp.float64)
+            out["z_mean"] = float(xp.mean(z))
+            out["z_std"] = float(xp.std(z))
+        except Exception:
+            out["z_mean"] = float(numpy.mean(pts_cam_m[:, 2]))
+            out["z_std"] = float(numpy.std(pts_cam_m[:, 2]))
+    else:
+        out["z_mean"] = float(numpy.mean(pts_cam_m[:, 2]))
+        out["z_std"] = float(numpy.std(pts_cam_m[:, 2]))
+    if image_bgra is not None and image_bgra.size > 0:
+        gray = cv2.cvtColor(image_bgra, cv2.COLOR_BGRA2GRAY)
+        out["gray_blur"] = cv2.GaussianBlur(gray, (5, 5), 0)
+    if camera_intrinsic is not None and pts_cam_m.shape[0] > 0:
+        K = numpy.asarray(camera_intrinsic, dtype=numpy.float64)
+        p = pts_cam_m[: min(50000, pts_cam_m.shape[0])]
+        z = p[:, 2]
+        m = z > 0.08
+        if numpy.any(m):
+            u = K[0, 0] * (p[m, 0] / p[m, 2]) + K[0, 2]
+            v = K[1, 1] * (p[m, 1] / p[m, 2]) + K[1, 2]
+            out["uv_stats"] = (float(numpy.min(u)), float(numpy.max(u)), float(numpy.min(v)), float(numpy.max(v)))
+    return out
+
+
+def refine_plane_from_cluster_bottom_points(
+    pts: numpy.ndarray,
+    plane_model: numpy.ndarray,
+    camera_pose: numpy.ndarray,
+) -> numpy.ndarray:
+    """RANSAC plane on bottom layer of this cluster only (local table under the cube)."""
+    pm = flip_plane_to_robot_up(plane_model, camera_pose)
+    h = _signed_plane_dist(pts, pm)
+    h_min = float(numpy.min(h))
+    h_max = float(numpy.max(h))
+    span = max(h_max - h_min, 1e-9)
+    mask = h <= h_min + CLUSTER_PLANE_BOTTOM_FRAC * span
+    if int(numpy.sum(mask)) < 35:
+        return numpy.asarray(plane_model, dtype=numpy.float64)
+    p = pts[mask]
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(p.astype(numpy.float64))
+    try:
+        plane_new, inliers = pcd.segment_plane(
+            distance_threshold=CLUSTER_PLANE_RANSAC_DIST_M,
+            ransac_n=3,
+            num_iterations=400,
+        )
+    except Exception:
+        return numpy.asarray(plane_model, dtype=numpy.float64)
+    if len(inliers) < CLUSTER_PLANE_MIN_INLIER_FRAC * float(p.shape[0]):
+        return numpy.asarray(plane_model, dtype=numpy.float64)
+    pn = numpy.asarray(plane_new, dtype=numpy.float64)
+    return flip_plane_to_robot_up(pn, camera_pose)
+
+
+def rotation_from_obb_pin_z_up(pts_cam: numpy.ndarray, n_up_cam: numpy.ndarray) -> numpy.ndarray | None:
+    """
+    Cube rotation in camera frame from 3D OBB: cube +Z aligns with table normal ``n_up_cam``.
+    Avoids minAreaRect on a **square** footprint (degenerate / ~45° jumps).
+    """
+    if pts_cam.shape[0] < 30:
+        return None
+    n_up_cam = numpy.asarray(n_up_cam, dtype=numpy.float64).reshape(3)
+    n_up_cam = n_up_cam / (numpy.linalg.norm(n_up_cam) + 1e-12)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts_cam.astype(numpy.float64))
+    try:
+        obb = pcd.get_oriented_bounding_box()
+        R = numpy.asarray(obb.R, dtype=numpy.float64)
+    except Exception:
+        return None
+    if R.shape != (3, 3):
+        return None
+    axes = [R[:, 0].copy(), R[:, 1].copy(), R[:, 2].copy()]
+    best_i = 0
+    best_d = -1.0
+    for i, ax in enumerate(axes):
+        ax = ax / (numpy.linalg.norm(ax) + 1e-12)
+        d = abs(float(numpy.dot(ax, n_up_cam)))
+        if d > best_d:
+            best_d, best_i = d, i
+    if best_d < 0.45:
+        return None
+    z_axis = axes[best_i]
+    if float(numpy.dot(z_axis, n_up_cam)) < 0.0:
+        z_axis = -z_axis
+    z_axis = z_axis / (numpy.linalg.norm(z_axis) + 1e-12)
+    x_axis = None
+    x_norm = 0.0
+    for i in range(3):
+        if i == best_i:
+            continue
+        v = axes[i]
+        x_proj = v - numpy.dot(v, z_axis) * z_axis
+        xn = float(numpy.linalg.norm(x_proj))
+        if xn > x_norm + 1e-9:
+            x_norm = xn
+            x_axis = x_proj / xn
+    if x_axis is None or x_norm < 1e-8:
+        e1, e2 = _in_plane_basis(z_axis)
+        x_axis = e1 - numpy.dot(e1, z_axis) * z_axis
+        x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
+    y_axis = numpy.cross(z_axis, x_axis)
+    y_axis = y_axis / (numpy.linalg.norm(y_axis) + 1e-12)
+    x_axis = numpy.cross(y_axis, z_axis)
+    x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
+    return orthonormalize_rotation(numpy.column_stack([x_axis, y_axis, z_axis]))
 
 
 def _nominal_edge_bucket(edge_m: float) -> str:
@@ -475,20 +614,19 @@ def h_contact_percentile_for_edge(edge_m: float) -> float:
     return 0.0
 
 
-def icp_refine_cube_pose_cam(
+def _icp_single_with_metrics(
     pts_cam: numpy.ndarray,
     t_cam_init: numpy.ndarray,
     edge_m: float,
-) -> numpy.ndarray:
+) -> tuple[numpy.ndarray, float, float]:
     """
-    Refine cube pose in camera frame: register a synthetic ``edge_m`` cube mesh (centered
-    at origin in cube frame) to the measured cluster via Open3D ICP. Handles oblique views
-    without snapping to mat cardinals. Voxel / fine correspondence tightened for 30 mm cubes.
+    One Open3D ICP run. Returns (T_cam_cube, fitness, inlier_rmse). On failure returns
+    (T_init, 0.0, 1e9).
     """
     em = float(edge_m)
     T0 = numpy.asarray(t_cam_init, dtype=numpy.float64)
     if em < 1e-4 or pts_cam.shape[0] < 25:
-        return T0
+        return T0, 0.0, 1e9
     voxel_m, corr_fine_m, coarse_iters, fine_iters = _icp_tuning_for_edge(edge_m)
     mesh = o3d.geometry.TriangleMesh.create_box(em, em, em)
     mesh.translate(-numpy.array([em * 0.5, em * 0.5, em * 0.5], dtype=numpy.float64))
@@ -504,7 +642,7 @@ def icp_refine_cube_pose_cam(
             search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.012, max_nn=30)
         )
     except Exception:
-        return T0
+        return T0, 0.0, 1e9
     criteria_coarse = o3d.pipelines.registration.ICPConvergenceCriteria(
         relative_fitness=1e-6,
         relative_rmse=1e-6,
@@ -520,8 +658,9 @@ def icp_refine_cube_pose_cam(
             criteria_coarse,
         )
         T1 = numpy.asarray(reg1.transformation, dtype=numpy.float64)
-        if float(reg1.fitness) < ICP_MIN_FITNESS:
-            return T0
+        fit1 = float(reg1.fitness)
+        if fit1 < ICP_MIN_FITNESS:
+            return T0, fit1, 1e9
         try:
             target_ds.estimate_normals(
                 search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.008, max_nn=25)
@@ -529,7 +668,8 @@ def icp_refine_cube_pose_cam(
         except Exception:
             T = T1
             T[:3, :3] = orthonormalize_rotation(T[:3, :3])
-            return T
+            rmse = float(getattr(reg1, "inlier_rmse", 0.01))
+            return T, fit1, rmse
         criteria_fine = o3d.pipelines.registration.ICPConvergenceCriteria(
             max_iteration=int(fine_iters),
         )
@@ -542,12 +682,46 @@ def icp_refine_cube_pose_cam(
             criteria_fine,
         )
         T = numpy.asarray(reg2.transformation, dtype=numpy.float64)
-        if float(reg2.fitness) < ICP_MIN_FITNESS * 0.85:
+        fit2 = float(reg2.fitness)
+        rmse = float(getattr(reg2, "inlier_rmse", 0.0))
+        if fit2 < ICP_MIN_FITNESS * 0.85:
             T = T1
+            fit2 = fit1
+            rmse = float(getattr(reg1, "inlier_rmse", rmse))
         T[:3, :3] = orthonormalize_rotation(T[:3, :3])
-        return T
+        return T, fit2, rmse
     except Exception:
-        return T0
+        return T0, 0.0, 1e9
+
+
+def icp_refine_cube_pose_cam(
+    pts_cam: numpy.ndarray,
+    t_cam_init: numpy.ndarray,
+    edge_m: float,
+) -> numpy.ndarray:
+    """
+    Multi-hypothesis ICP: cube has 4-fold symmetry about vertical in top view; a single ICP
+    can settle in a wrong 90° local minimum. Try four 90° rotations about cube +Z in the
+    initial pose, keep the result with **lowest inlier RMSE** (then highest fitness).
+    """
+    T0 = numpy.asarray(t_cam_init, dtype=numpy.float64)
+    R0 = T0[:3, :3].copy()
+    best_T = T0
+    best_key = (1e9, -1.0)
+    for k in range(4):
+        ang = k * (numpy.pi * 0.5)
+        c, s = numpy.cos(ang), numpy.sin(ang)
+        Rz = numpy.eye(3, dtype=numpy.float64)
+        Rz[0, 0], Rz[0, 1] = c, -s
+        Rz[1, 0], Rz[1, 1] = s, c
+        Tk = numpy.copy(T0)
+        Tk[:3, :3] = R0 @ Rz
+        Tm, fit, rmse = _icp_single_with_metrics(pts_cam, Tk, edge_m)
+        key = (rmse, -fit)
+        if key < best_key:
+            best_key = key
+            best_T = Tm
+    return best_T
 
 
 def refine_cube_pose_bound_center_cam(
@@ -605,30 +779,39 @@ def compute_cube_pose_o2(
     edge_m: float,
 ) -> tuple[numpy.ndarray, numpy.ndarray] | None:
     """
-    Seed pose from ``physical_cube_pose_from_points`` (table plane + footprint), one
-    bound-center + height snap along the plane normal, then **Open3D ICP** (synthetic cube
-    mesh → cloud). **Translation** is then blended with a **table-plane footprint centroid**
-    (size-dependent weight; large cubes → ~92% footprint for ~35 mm gripper vs 30 mm stock),
-    extra AABB centering in cube frame, then robot pose.
+    **No** minAreaRect yaw on the square footprint (major source of ~45° errors). Pipeline:
+    per-cluster **plane refit**, **3D OBB** rotation with cube Z = table normal, translation
+    from **footprint centroid** + height snap, **multi-hypothesis ICP**, footprint blend,
+    bound-centering. Fallback: legacy ``physical_cube_pose_from_points`` rotation only if OBB fails.
     """
     if pts.shape[0] < 30:
         return None
-    pair = physical_cube_pose_from_points(
-        pts,
-        plane_model,
-        camera_pose,
-        edge_m,
-        yaw_source=PHYSICAL_INIT_YAW_SOURCE,
-    )
-    if pair is None:
-        return None
-    _, t_cam = pair
-    t_cam = numpy.copy(t_cam)
+    plane_ref = refine_plane_from_cluster_bottom_points(pts, plane_model, camera_pose)
+    pm = flip_plane_to_robot_up(plane_ref, camera_pose)
+    n_up = pm[:3] / (numpy.linalg.norm(pm[:3]) + 1e-12)
+
+    c_init = cube_center_from_bottom_footprint(pts, plane_ref, camera_pose, edge_m)
+    R_init = rotation_from_obb_pin_z_up(pts, n_up)
+    if R_init is None:
+        pair_fb = physical_cube_pose_from_points(
+            pts,
+            plane_ref,
+            camera_pose,
+            edge_m,
+            yaw_source=PHYSICAL_INIT_YAW_SOURCE,
+        )
+        if pair_fb is None:
+            return None
+        R_init = numpy.asarray(pair_fb[1][:3, :3], dtype=numpy.float64)
+
+    t_cam = numpy.eye(4, dtype=numpy.float64)
+    t_cam[:3, :3] = orthonormalize_rotation(R_init)
+    t_cam[:3, 3] = c_init
     t_cam = refine_cube_pose_bound_center_cam(pts, t_cam, PHYSICAL_INIT_BOUND_EXTRA)
     c = snap_cube_center_along_plane_normal(
         t_cam[:3, 3],
         pts,
-        plane_model,
+        plane_ref,
         camera_pose,
         edge_m,
         h_contact_percentile=h_contact_percentile_for_edge(edge_m),
@@ -636,7 +819,7 @@ def compute_cube_pose_o2(
     t_cam[:3, 3] = c
     t_cam = icp_refine_cube_pose_cam(pts, t_cam, edge_m)
     t_cam = refine_translation_footprint_icp_blend(
-        t_cam, pts, plane_model, camera_pose, edge_m
+        t_cam, pts, plane_ref, camera_pose, edge_m
     )
     t_cam = refine_cube_pose_bound_center_cam(pts, t_cam, bound_center_iters_after_icp(edge_m))
     # P_cam = T_cam_robot @ P_robot and P_cam = T_cam_cube @ P_cube  →  T_robot_cube = T_robot_cam @ T_cam_cube
@@ -674,6 +857,8 @@ def detect_cubes_once(
     full_pts_m = points_to_scene_meters(point_cloud, camera_pose)
     if full_pts_m.shape[0] < 120:
         return []
+
+    _ = preprocess_scene_observation(image, full_pts_m, camera_intrinsic)
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(full_pts_m)
