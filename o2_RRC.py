@@ -4,9 +4,9 @@ o2_RRC — challenge 2: **9 cubes** (one per size × color), **AprilTag** board 
 in three tiers (3× large, 3× medium, 3× small), with **left→right board color order**
 from mean robot XY per hue class.
 
-Vision: GPU depth mask, dense crops, precise nominal pose, HSV color id on image ROI,
-multi-frame fusion. Tune ``POSE_SAMPLES``, ``REFINE_AABB_ITERS``, HSV bands in
-``color_id_from_image_patch``.
+Vision: optional CPU depth gate, playmat ROI in robot frame, dense crops, nominal pose,
+HSV color on image ROI, short multi-frame fusion. Tune ``PLAYMAT_*_M``, ``POSE_SAMPLES``,
+``REFINE_AABB_ITERS``, HSV in ``color_id_from_image_patch``.
 """
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ ARM_SPEED_APPROACH = 280
 ARM_SPEED_PLACE_FINAL = 55
 ARM_SPEED_LIFT = 900
 ARM_SPEED_GRASP_DESCEND = 200
-GRIPPER_SETTLE_GRASP_S = 0.42
+GRIPPER_SETTLE_GRASP_S = 0.28
 GRIPPER_SETTLE_PLACE_S = 0.55
 RELEASE_WAIT_S = 0.55
 # First move to XY past the cube (away from stack), then slide in at safe Z — avoids sweeping through neighbors
@@ -96,17 +96,29 @@ REF_CUBE_HEIGHT_M = CUBE_SIZE_LARGE_M  # 30 mm — worst-case safe clearance
 MAX_CLUSTERS = 9
 # Merge fused detections whose centers are closer than ~1.5× min cube edge (split clusters / duplicates)
 DEDUPE_MIN_SEP_M = 0.017
-# Multi-frame fusion — more frames = stabler pose (slower)
-POSE_SAMPLES = 6
-POSE_SAMPLE_DT_S = 0.08
+# Multi-frame fusion — lower = faster pick cycles (tune if pose jitters)
+POSE_SAMPLES = 3
+POSE_SAMPLE_DT_S = 0.04
+# Preview uses fewer frames so the first window opens quickly
+POSE_SAMPLES_PREVIEW = 2
 
 # Dense geometry (accuracy over speed)
 GPU_Z_MIN_M = 0.30
-GPU_Z_MAX_M = 2.00
+GPU_Z_MAX_M = 1.15
+# Torch morphological mask can add latency; simple Z threshold is faster
+O2_USE_GPU_DEPTH_MASK = False
 DENSE_CROP_MARGIN_M = 0.006
 BOTTOM_LAYER_FRAC = 0.20
-REFINE_AABB_ITERS = 18
-REFINE_AABB_ITERS_POST_VERTICAL = 8
+REFINE_AABB_ITERS = 10
+REFINE_AABB_ITERS_POST_VERTICAL = 5
+
+# Playmat only (robot base frame, meters) — cubes outside this box are ignored (tune to your mat)
+PLAYMAT_X_MIN_M = 0.20
+PLAYMAT_X_MAX_M = 0.52
+PLAYMAT_Y_MIN_M = -0.20
+PLAYMAT_Y_MAX_M = 0.20
+PLAYMAT_Z_MIN_M = -0.08
+PLAYMAT_Z_MAX_M = 0.45
 
 # Arena: 9 cubes = 3 sizes × 3 colors; stack bottom = largest tier, top = smallest
 TOTAL_CUBES = 9
@@ -261,6 +273,10 @@ def gpu_depth_mask(point_cloud) -> numpy.ndarray | None:
     """CUDA morphological depth mask when torch is available; else CPU threshold."""
     if point_cloud is None:
         return None
+    if not O2_USE_GPU_DEPTH_MASK:
+        z = point_cloud[..., 2]
+        m = numpy.isfinite(z) & (z > GPU_Z_MIN_M) & (z < GPU_Z_MAX_M)
+        return (m.astype(numpy.uint8) * 255)
     z = point_cloud[..., 2]
     if torch is None:
         m = numpy.isfinite(z) & (z > GPU_Z_MIN_M) & (z < GPU_Z_MAX_M)
@@ -296,6 +312,53 @@ def points_to_scene_meters(point_cloud) -> numpy.ndarray:
         return numpy.zeros((0, 3), dtype=numpy.float64)
     pts_m, _ = points_to_meters_open3d(pts)
     return pts_m.astype(numpy.float64)
+
+
+def filter_pointcloud_playmat_robot(
+    pts_cam_m: numpy.ndarray,
+    T_cam_robot: numpy.ndarray,
+) -> numpy.ndarray:
+    """
+    Keep points that project into the playmat in **robot** frame (drops far background / off-mat).
+    ``pts_cam_m`` are in the ZED left-camera frame (meters).
+    """
+    if pts_cam_m.shape[0] == 0:
+        return pts_cam_m
+    T = numpy.asarray(T_cam_robot, dtype=numpy.float64)
+    T_rc = numpy.linalg.inv(T)
+    ph = numpy.concatenate(
+        [pts_cam_m, numpy.ones((pts_cam_m.shape[0], 1), dtype=numpy.float64)],
+        axis=1,
+    )
+    pr = (T_rc @ ph.T).T[:, :3]
+    m = (
+        (pr[:, 0] >= PLAYMAT_X_MIN_M)
+        & (pr[:, 0] <= PLAYMAT_X_MAX_M)
+        & (pr[:, 1] >= PLAYMAT_Y_MIN_M)
+        & (pr[:, 1] <= PLAYMAT_Y_MAX_M)
+        & (pr[:, 2] >= PLAYMAT_Z_MIN_M)
+        & (pr[:, 2] <= PLAYMAT_Z_MAX_M)
+    )
+    out = pts_cam_m[m]
+    if out.shape[0] < 100:
+        return numpy.zeros((0, 3), dtype=numpy.float64)
+    return out
+
+
+def filter_detections_playmat(dets: list[dict]) -> list[dict]:
+    """Drop cubes whose centers fall outside the playmat (safety net)."""
+    if not dets:
+        return dets
+    out: list[dict] = []
+    for d in dets:
+        p = numpy.asarray(d["t_robot"][:3, 3], dtype=numpy.float64)
+        if (
+            PLAYMAT_X_MIN_M <= p[0] <= PLAYMAT_X_MAX_M
+            and PLAYMAT_Y_MIN_M <= p[1] <= PLAYMAT_Y_MAX_M
+            and PLAYMAT_Z_MIN_M <= p[2] <= PLAYMAT_Z_MAX_M
+        ):
+            out.append(d)
+    return out
 
 
 def extract_dense_cluster_points(
@@ -491,6 +554,7 @@ def detect_all_cubes_adaptive(
     K = numpy.asarray(camera_intrinsic, dtype=numpy.float64)
 
     full_pts_m = points_to_scene_meters(point_cloud)
+    full_pts_m = filter_pointcloud_playmat_robot(full_pts_m, camera_pose)
     if full_pts_m.shape[0] < 120:
         return []
 
@@ -595,7 +659,8 @@ def detect_all_cubes_adaptive_fused(
         t_r[:3, 3] = pos
         t_cam = camera_pose @ t_r
         fused.append({"t_robot": t_r, "t_cam": t_cam, "edge_m": edge_m, "color_id": color_id})
-    return dedupe_detections_by_position(fused)
+    fused = dedupe_detections_by_position(fused)
+    return filter_detections_playmat(fused)
 
 
 def compute_safe_clearance_z_mm(tower_top_z_m, cube_center_z_m, cube_height_m):
@@ -751,10 +816,21 @@ def run_challenge_o2_irregular(
             print("Calibration failed.")
             return 0
         obs = (cv_image, point_cloud)
-        dets = detect_all_cubes_adaptive_fused(obs, camera_intrinsic, t_cam_robot)
+        dets = detect_all_cubes_adaptive_fused(
+            obs,
+            camera_intrinsic,
+            t_cam_robot,
+            n_samples=POSE_SAMPLES_PREVIEW,
+            dt_s=POSE_SAMPLE_DT_S,
+        )
         if not dets:
-            print("Preview: no cubes detected.")
+            print("Preview: no cubes detected (check playmat bounds PLAYMAT_*_M).")
             return 0
+        if len(dets) < TOTAL_CUBES:
+            print(
+                f"Preview: only {len(dets)}/{TOTAL_CUBES} cubes on playmat — "
+                "place all cubes on the mat or widen PLAYMAT_*_M."
+            )
         col_order = board_color_order_left_to_right(dets)
         plan = build_stack_plan(col_order)
         dets.sort(key=lambda d: -d["edge_m"])
@@ -805,6 +881,11 @@ def run_challenge_o2_irregular(
             break
 
         if stack_plan is None:
+            if len(dets) < TOTAL_CUBES:
+                print(
+                    f"o2_RRC: {len(dets)}/{TOTAL_CUBES} cubes visible on playmat — "
+                    "plan uses colors present; add cubes or tune PLAYMAT_*_M."
+                )
             stack_plan = build_stack_plan(board_color_order_left_to_right(dets))
 
         step = int(placed)
