@@ -19,6 +19,9 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+# Quieter Qt/highgui on some macOS setups (reduces font plugin noise with cv2.imshow)
+os.environ.setdefault("QT_LOGGING_RULES", "*.debug=false;qt.qpa.*=false")
+
 import cv2
 import numpy
 import open3d as o3d
@@ -61,18 +64,24 @@ PLACE_Z_OFFSET = 0.003
 TOOL_ROLL_DEG = 180.0
 TOOL_PITCH_DEG = 0.0
 
-SAFE_CLEARANCE_CUBE_HEIGHTS = 1.5
-MIN_GRASP_ABOVE_CUBE_M = 0.038
+SAFE_CLEARANCE_CUBE_HEIGHTS = 1.55
+MIN_GRASP_ABOVE_CUBE_M = 0.048
 SAFE_Z_MIN_M = 0.10
 SAFE_Z_MAX_M = 0.36
 
-ARM_SPEED_FAST = 2200
-ARM_SPEED_APPROACH = 450
-ARM_SPEED_PLACE_FINAL = 85
-ARM_SPEED_LIFT = 1800
-GRIPPER_SETTLE_GRASP_S = 0.35
+# Cartesian speeds (mm/s) — reduced to limit collisions and overshoot
+ARM_SPEED_TRAVEL = 1100
+ARM_SPEED_APPROACH = 280
+ARM_SPEED_PLACE_FINAL = 55
+ARM_SPEED_LIFT = 900
+ARM_SPEED_GRASP_DESCEND = 200
+GRIPPER_SETTLE_GRASP_S = 0.42
 GRIPPER_SETTLE_PLACE_S = 0.55
 RELEASE_WAIT_S = 0.55
+# First move to XY past the cube (away from stack), then slide in at safe Z — avoids sweeping through neighbors
+GRASP_XY_BACKOFF_M = 0.024
+# Align parallel jaws with a cube face (vision yaw can be off ~45°)
+GRASP_YAW_OFFSET_DEG = 0.0
 # Last millimeters of descent at ARM_SPEED_PLACE_FINAL (mm above nominal place height)
 PLACE_SOFT_LAST_MM = 7.0
 
@@ -83,7 +92,10 @@ EDGE_MIN_M = 0.021
 EDGE_MAX_M = 0.032
 REF_CUBE_HEIGHT_M = CUBE_SIZE_LARGE_M  # 30 mm — worst-case safe clearance
 
-MAX_CLUSTERS = 14
+# Arena has at most 9 cubes; cap clusters to reduce duplicate / spurious blobs
+MAX_CLUSTERS = 9
+# Merge fused detections whose centers are closer than ~1.5× min cube edge (split clusters / duplicates)
+DEDUPE_MIN_SEP_M = 0.017
 # Multi-frame fusion — more frames = stabler pose (slower)
 POSE_SAMPLES = 6
 POSE_SAMPLE_DT_S = 0.08
@@ -510,6 +522,25 @@ def detect_all_cubes_adaptive(
     return out
 
 
+def dedupe_detections_by_position(dets: list[dict], min_sep_m: float = DEDUPE_MIN_SEP_M) -> list[dict]:
+    """Drop duplicate clusters (same physical cube split into two blobs). Keep larger nominal edge first."""
+    if len(dets) <= 1:
+        return dets
+    ordered = sorted(dets, key=lambda d: (-float(d["edge_m"]), -float(d["t_robot"][2, 3])))
+    kept: list[dict] = []
+    for d in ordered:
+        p = numpy.asarray(d["t_robot"][:3, 3], dtype=numpy.float64)
+        ok = True
+        for k in kept:
+            q = numpy.asarray(k["t_robot"][:3, 3], dtype=numpy.float64)
+            if float(numpy.linalg.norm(p - q)) < float(min_sep_m):
+                ok = False
+                break
+        if ok:
+            kept.append(d)
+    return kept
+
+
 def detect_all_cubes_adaptive_fused(
     observation,
     camera_intrinsic,
@@ -564,7 +595,7 @@ def detect_all_cubes_adaptive_fused(
         t_r[:3, 3] = pos
         t_cam = camera_pose @ t_r
         fused.append({"t_robot": t_r, "t_cam": t_cam, "edge_m": edge_m, "color_id": color_id})
-    return fused
+    return dedupe_detections_by_position(fused)
 
 
 def compute_safe_clearance_z_mm(tower_top_z_m, cube_center_z_m, cube_height_m):
@@ -589,9 +620,28 @@ def set_line(arm, x_mm, y_mm, z_mm, yaw_deg, speed):
     )
 
 
+def snap_yaw_to_face_deg(yaw_deg: float) -> float:
+    """Nearest 90° yaw so parallel jaws tend to wrap opposite faces (not corner-on)."""
+    y = float(yaw_deg)
+    y = ((y + 180.0) % 360.0) - 180.0
+    return round(y / 90.0) * 90.0
+
+
+def grasp_retreat_xy_m(x_m: float, y_m: float) -> tuple[float, float]:
+    """XY past the cube along tower->cube (further from stack); approach from outside the pile."""
+    dx = float(x_m) - TOWER_X_M
+    dy = float(y_m) - TOWER_Y_M
+    dist = float(numpy.hypot(dx, dy))
+    if dist < 1e-5:
+        return x_m, y_m
+    ux, uy = dx / dist, dy / dist
+    return float(x_m + ux * GRASP_XY_BACKOFF_M), float(y_m + uy * GRASP_XY_BACKOFF_M)
+
+
 def grasp_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
     xyz = cube_pose[:3, 3]
-    x_mm, y_mm, z_mm = (xyz * 1000.0).tolist()
+    x_m, y_m, z_m = float(xyz[0]), float(xyz[1]), float(xyz[2])
+    x_mm, y_mm, z_mm = x_m * 1000.0, y_m * 1000.0, z_m * 1000.0
     z_c_m = float(xyz[2])
     safe_z_mm = compute_safe_clearance_z_mm(tower_top_z_m, z_c_m, cube_height_m)
     grasp_z_mm = z_mm + (GRASP_Z_OFFSET * 1000.0)
@@ -599,20 +649,26 @@ def grasp_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
 
     cube_r = Rotation.from_matrix(cube_pose[:3, :3])
     _, _, cube_yaw_deg = cube_r.as_euler("xyz", degrees=True)
+    yaw_use = snap_yaw_to_face_deg(cube_yaw_deg) + GRASP_YAW_OFFSET_DEG
+
+    x_r_m, y_r_m = grasp_retreat_xy_m(x_m, y_m)
+    x_r_mm, y_r_mm = x_r_m * 1000.0, y_r_m * 1000.0
 
     arm.open_lite6_gripper()
     time.sleep(GRIPPER_SETTLE_GRASP_S)
-    set_line(arm, x_mm, y_mm, safe_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
-    set_line(arm, x_mm, y_mm, grasp_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
+    # High Z: move to retreat XY (past cube), then to cube XY — avoids horizontal swipe through neighbors
+    set_line(arm, x_r_mm, y_r_mm, safe_z_mm, yaw_use, ARM_SPEED_TRAVEL)
+    set_line(arm, x_mm, y_mm, safe_z_mm, yaw_use, ARM_SPEED_TRAVEL)
+    set_line(arm, x_mm, y_mm, grasp_z_mm, yaw_use, ARM_SPEED_GRASP_DESCEND)
     arm.close_lite6_gripper()
     time.sleep(GRIPPER_SETTLE_GRASP_S)
-    set_line(arm, x_mm, y_mm, lift_z_mm, cube_yaw_deg, ARM_SPEED_LIFT)
+    set_line(arm, x_mm, y_mm, lift_z_mm, yaw_use, ARM_SPEED_LIFT)
 
 
 def place_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
     """
-    Place at ``cube_pose`` XY/Z with a softer landing: approach fast, slow last
-    millimeters, then dwell after opening the gripper.
+    Place at ``cube_pose`` XY/Z: travel at reduced speed, slow last millimeters,
+    then dwell after opening the gripper.
     """
     xyz = cube_pose[:3, 3]
     x_mm, y_mm, z_mm = (xyz * 1000.0).tolist()
@@ -624,16 +680,17 @@ def place_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
     cube_r = Rotation.from_matrix(cube_pose[:3, :3])
     _, _, cube_yaw_deg = cube_r.as_euler("xyz", degrees=True)
 
-    set_line(arm, x_mm, y_mm, safe_z_mm, cube_yaw_deg, ARM_SPEED_FAST)
+    yaw_place = snap_yaw_to_face_deg(cube_yaw_deg) + GRASP_YAW_OFFSET_DEG
+    set_line(arm, x_mm, y_mm, safe_z_mm, yaw_place, ARM_SPEED_TRAVEL)
     # Descend most of the way at moderate speed
     pre_touch_mm = place_z_mm - PLACE_SOFT_LAST_MM
     if pre_touch_mm > safe_z_mm + 0.5:
-        set_line(arm, x_mm, y_mm, pre_touch_mm, cube_yaw_deg, ARM_SPEED_APPROACH)
-    set_line(arm, x_mm, y_mm, place_z_mm, cube_yaw_deg, ARM_SPEED_PLACE_FINAL)
+        set_line(arm, x_mm, y_mm, pre_touch_mm, yaw_place, ARM_SPEED_APPROACH)
+    set_line(arm, x_mm, y_mm, place_z_mm, yaw_place, ARM_SPEED_PLACE_FINAL)
     arm.open_lite6_gripper()
     time.sleep(GRIPPER_SETTLE_PLACE_S)
     time.sleep(RELEASE_WAIT_S)
-    set_line(arm, x_mm, y_mm, lift_z_mm, cube_yaw_deg, ARM_SPEED_LIFT)
+    set_line(arm, x_mm, y_mm, lift_z_mm, yaw_place, ARM_SPEED_LIFT)
 
 
 def stack_target_pose(source_pose: numpy.ndarray, tower_x_m: float, tower_y_m: float, z_center_m: float) -> numpy.ndarray:
@@ -646,19 +703,24 @@ def stack_target_pose(source_pose: numpy.ndarray, tower_x_m: float, tower_y_m: f
 
 
 def draw_status_overlay(image_bgra, lines, color=(0, 220, 0)):
+    """ASCII-only text; LINE_8 avoids some Qt/font backend issues on macOS."""
     out = image_bgra.copy()
     y = 36
     for line in lines:
-        cv2.putText(
-            out,
-            line[:120],
-            (16, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
+        safe = "".join(c if 32 <= ord(c) < 127 else "?" for c in str(line)[:120])
+        try:
+            cv2.putText(
+                out,
+                safe,
+                (16, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                color,
+                2,
+                cv2.LINE_8,
+            )
+        except Exception:
+            pass
         y += 26
     return out
 
@@ -702,7 +764,7 @@ def run_challenge_o2_irregular(
         plan_str = " | ".join([f"{e * 1000:.0f}mm c{c}" for e, c in plan[:6]])
         plan_str2 = " | ".join([f"{e * 1000:.0f}mm c{c}" for e, c in plan[6:9]])
         lines = [
-            f"o2_RRC: {len(dets)} cubes  colors L→R (id): {col_order}",
+            f"o2_RRC: {len(dets)} cubes  colors L to R (id): {col_order}",
             f"Plan (9): {plan_str}",
             plan_str2,
             "Press k to run planned stack, any other key to abort",
