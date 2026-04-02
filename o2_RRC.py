@@ -237,12 +237,35 @@ def cube_pose_z_up_robot_face_minrect(
     pts_cam: numpy.ndarray,
     plane_model: numpy.ndarray,
     camera_pose: numpy.ndarray,
-    edge_m: float,
+    *args,
+    **kwargs,
 ) -> tuple[numpy.ndarray, numpy.ndarray] | None:
     """
     Cube frame in **robot base**: Z = +world up; X from min-area rect long edge on the
     bottom footprint (robot XY); Y = Z × X. Translation from bottom layer in robot frame.
+
+    Cube edge length: 4th positional or ``edge_m=`` (meters).
     """
+    edge_m: float | None = None
+    if len(args) == 1:
+        edge_m = args[0]
+    elif len(args) > 1:
+        raise TypeError(
+            f"cube_pose_z_up_robot_face_minrect() takes at most 4 positional arguments ({len(args) + 3} given)"
+        )
+    if "edge_m" in kwargs:
+        if edge_m is not None:
+            raise TypeError("cube_pose_z_up_robot_face_minrect(): edge_m specified twice")
+        edge_m = kwargs.pop("edge_m")
+    if kwargs:
+        raise TypeError(
+            "cube_pose_z_up_robot_face_minrect() got unexpected keyword arguments: "
+            f"{sorted(kwargs.keys())}"
+        )
+    if edge_m is None:
+        return None
+    edge_m = float(edge_m)
+
     if pts_cam.shape[0] < 30:
         return None
 
