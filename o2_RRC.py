@@ -1,18 +1,12 @@
 """
-o2_RRC — irregular skyscraper (challenge 2) with **adaptive cube size** and
-**largest-first** placement: each cycle picks the **biggest remaining** cube on
-the table for the next stack level (big cubes tend to form the base).
+o2_RRC — challenge 2: **9 cubes** (one per size × color), **AprilTag** board calibration
+(``checkpoint0``), nominal edges 22.5 / 25 / 30 mm, **stack plan: largest → smallest**
+in three tiers (3× large, 3× medium, 3× small), with **left→right board color order**
+from mean robot XY per hue class.
 
-Vision reuses ``orientation_RRC`` table plane + physical pose. Edge length is
-estimated then **snapped** to the nearest nominal size (**22.5 mm** / **25 mm** /
-**30 mm**). Challenge 1 uses 25 mm cubes; challenge 2 may mix sizes (see
-``orientation_RRC.CUBE_SIZE_*_M``).
-
-Stack **XY** is fixed (``TOWER_X_M`` / ``TOWER_Y_M``); **Z** grows from the table
-surface upward by each cube’s snapped edge length. Placement uses a slower final
-descent and longer release dwell.
-
-Run: ``python o2_RRC.py`` (working directory arbitrary; project root on ``sys.path``).
+Vision: GPU depth mask, dense crops, precise nominal pose, HSV color id on image ROI,
+multi-frame fusion. Tune ``POSE_SAMPLES``, ``REFINE_AABB_ITERS``, HSV bands in
+``color_id_from_image_patch``.
 """
 from __future__ import annotations
 
@@ -34,8 +28,6 @@ from xarm.wrapper import XArmAPI
 from checkpoint0 import get_transform_camera_robot
 from checkpoint1 import GRIPPER_LENGTH, robot_ip
 from orientation_RRC import (
-    BOUND_CENTER_ITERS,
-    BOTTOM_LAYER_FRAC,
     CUBE_SIZE_LARGE_M,
     CUBE_SIZE_MEDIUM_M,
     CUBE_SIZE_SMALL_M,
@@ -48,6 +40,11 @@ from orientation_RRC import (
 )
 from utils.vis_utils import draw_pose_axes
 from utils.zed_camera import ZedCamera
+
+try:
+    import torch
+except Exception:
+    torch = None
 
 ########################################################
 # Fixed tower location in robot frame (meters) — tune for your arena / stage
@@ -87,13 +84,154 @@ EDGE_MAX_M = 0.032
 REF_CUBE_HEIGHT_M = CUBE_SIZE_LARGE_M  # 30 mm — worst-case safe clearance
 
 MAX_CLUSTERS = 14
-POSE_SAMPLES = 2
-POSE_SAMPLE_DT_S = 0.05
+# Multi-frame fusion — more frames = stabler pose (slower)
+POSE_SAMPLES = 6
+POSE_SAMPLE_DT_S = 0.08
+
+# Dense geometry (accuracy over speed)
+GPU_Z_MIN_M = 0.30
+GPU_Z_MAX_M = 2.00
+DENSE_CROP_MARGIN_M = 0.006
+BOTTOM_LAYER_FRAC = 0.20
+REFINE_AABB_ITERS = 18
+REFINE_AABB_ITERS_POST_VERTICAL = 8
+
+# Arena: 9 cubes = 3 sizes × 3 colors; stack bottom = largest tier, top = smallest
+TOTAL_CUBES = 9
+# Hue classification (OpenCV H 0–180); tune for your lighting / cube paints
+HSV_RED_ORANGE = (0, 18)
+HSV_RED_HIGH = (165, 180)
+HSV_GREEN = (38, 95)
+HSV_BLUE = (95, 135)
 
 
 def snap_edge_to_nominal(edge_m: float) -> float:
     """Map a noisy edge estimate to the closest of 22.5 / 25 / 30 mm."""
     return min(CUBE_SIZES_M, key=lambda s: abs(float(s) - float(edge_m)))
+
+
+# Stack plan: three tiers (large → medium → small); within each tier, left → right on the table
+STACK_SIZE_ORDER = (CUBE_SIZE_LARGE_M, CUBE_SIZE_MEDIUM_M, CUBE_SIZE_SMALL_M)
+# Match fused edge to plan step (nominal values; float tolerance)
+EDGE_MATCH_TOL_M = 0.0008
+
+
+def cam_center_to_pixel(t_cam: numpy.ndarray, K: numpy.ndarray) -> tuple[float, float] | None:
+    """Project cube center (camera frame, column of ``t_cam``) to pixel coordinates."""
+    c = numpy.asarray(t_cam[:3, 3], dtype=numpy.float64)
+    z = float(c[2])
+    if z <= 1e-7:
+        return None
+    K = numpy.asarray(K, dtype=numpy.float64)
+    u = float(K[0, 0] * c[0] / z + K[0, 2])
+    v = float(K[1, 1] * c[1] / z + K[1, 2])
+    return u, v
+
+
+def color_id_from_image_patch(
+    image_bgra: numpy.ndarray,
+    u: float,
+    v: float,
+    radius: int = 14,
+) -> int:
+    """
+    Classify cube face color from BGRA image at projected center (HSV hue bands).
+    Returns 0 = red/orange, 1 = green, 2 = blue; tune bands for your lighting.
+    """
+    if image_bgra is None or image_bgra.size == 0:
+        return 0
+    h, w = image_bgra.shape[:2]
+    u0, v0 = int(round(u)), int(round(v))
+    x0 = max(0, u0 - radius)
+    x1 = min(w, u0 + radius + 1)
+    y0 = max(0, v0 - radius)
+    y1 = min(h, v0 + radius + 1)
+    if y1 <= y0 or x1 <= x0:
+        return 0
+    patch = image_bgra[y0:y1, x0:x1, :3]
+    if patch.size == 0:
+        return 0
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    h_vals = hsv[:, :, 0].astype(numpy.float64).ravel()
+    h_med = float(numpy.median(h_vals))
+    lo_r, hi_r = HSV_RED_ORANGE
+    lo_r2, hi_r2 = HSV_RED_HIGH
+    lo_g, hi_g = HSV_GREEN
+    lo_b, hi_b = HSV_BLUE
+    if h_med <= hi_r or h_med >= lo_r2:
+        return 0
+    if lo_g <= h_med <= hi_g:
+        return 1
+    if lo_b <= h_med <= hi_b:
+        return 2
+    # Ambiguous: partition 0–180 into three bins
+    return int(numpy.clip(round(h_med / 60.0), 0, 2))
+
+
+def board_color_order_left_to_right(dets: list[dict]) -> list[int]:
+    """
+    Order the three hue classes by mean robot **X** (left → right). Each color id
+    should appear equally often (3×) when all 9 cubes are visible.
+    """
+    sums = {0: numpy.zeros(3), 1: numpy.zeros(3), 2: numpy.zeros(3)}
+    counts = {0: 0, 1: 0, 2: 0}
+    for d in dets:
+        cid = int(d.get("color_id", 0))
+        cid = max(0, min(2, cid))
+        sums[cid] += d["t_robot"][:3, 3]
+        counts[cid] += 1
+    present = [c for c in (0, 1, 2) if counts[c] > 0]
+    if not present:
+        return [0, 1, 2]
+    means = {c: sums[c] / max(1, counts[c]) for c in present}
+    ordered = sorted(present, key=lambda c: float(means[c][0]))
+    # Ensure length 3 for plan: missing colors append in id order
+    for c in (0, 1, 2):
+        if c not in ordered:
+            ordered.append(c)
+    return ordered[:3]
+
+
+def build_stack_plan(color_ids_left_to_right: list[int]) -> list[tuple[float, int]]:
+    """Nine placements: for each size tier (large→small), left→right colors on the board."""
+    out: list[tuple[float, int]] = []
+    cols = color_ids_left_to_right[:3]
+    for edge_m in STACK_SIZE_ORDER:
+        for cid in cols:
+            out.append((float(edge_m), int(cid)))
+    return out
+
+
+def pick_matching_cube(
+    dets: list[dict],
+    target_edge_m: float,
+    target_color_id: int,
+) -> dict | None:
+    """Pick one detection matching nominal edge and color; prefer cube farther from tower XY (still on table)."""
+    best: dict | None = None
+    best_key: tuple[float, float] | None = None
+    tower_xy = numpy.array([TOWER_X_M, TOWER_Y_M], dtype=numpy.float64)
+    for d in dets:
+        if int(d.get("color_id", -1)) != int(target_color_id):
+            continue
+        if abs(float(d["edge_m"]) - float(target_edge_m)) > EDGE_MATCH_TOL_M:
+            continue
+        xy = d["t_robot"][:2, 3]
+        dist_tower = float(numpy.linalg.norm(xy - tower_xy))
+        edge_err = abs(float(d["edge_m"]) - float(target_edge_m))
+        # Prefer farther from tower (avoid already stacked cube); then tighter edge match
+        key = (-dist_tower, edge_err)
+        if best is None or key < best_key:
+            best = d
+            best_key = key
+    return best
+
+
+def pick_largest_fallback(dets: list[dict]) -> dict | None:
+    if not dets:
+        return None
+    dets = sorted(dets, key=lambda d: -float(d["edge_m"]))
+    return dets[0]
 
 
 def flip_plane_to_robot_up(plane_model: numpy.ndarray, camera_pose: numpy.ndarray) -> numpy.ndarray:
@@ -107,13 +245,72 @@ def flip_plane_to_robot_up(plane_model: numpy.ndarray, camera_pose: numpy.ndarra
     return pm
 
 
-def estimate_cube_edge_m(
+def gpu_depth_mask(point_cloud) -> numpy.ndarray | None:
+    """CUDA morphological depth mask when torch is available; else CPU threshold."""
+    if point_cloud is None:
+        return None
+    z = point_cloud[..., 2]
+    if torch is None:
+        m = numpy.isfinite(z) & (z > GPU_Z_MIN_M) & (z < GPU_Z_MAX_M)
+        return (m.astype(numpy.uint8) * 255)
+
+    use_cuda = torch.cuda.is_available()
+    device = "cuda" if use_cuda else "cpu"
+    z_t = torch.as_tensor(z, device=device, dtype=torch.float32)
+    finite = torch.isfinite(z_t)
+    mask = finite & (z_t > GPU_Z_MIN_M) & (z_t < GPU_Z_MAX_M)
+    x = mask.float().unsqueeze(0).unsqueeze(0)
+    for _ in range(2):
+        x = torch.nn.functional.max_pool2d(x, kernel_size=5, stride=1, padding=2)
+        x = 1.0 - torch.nn.functional.max_pool2d(1.0 - x, kernel_size=5, stride=1, padding=2)
+    for _ in range(1):
+        x = 1.0 - torch.nn.functional.max_pool2d(1.0 - x, kernel_size=3, stride=1, padding=1)
+        x = torch.nn.functional.max_pool2d(x, kernel_size=3, stride=1, padding=1)
+    m = (x[0, 0] > 0.5).detach().cpu().numpy()
+    return (m.astype(numpy.uint8) * 255)
+
+
+def points_to_scene_meters(point_cloud) -> numpy.ndarray:
+    """Finite points with optional GPU mask; convert to meters."""
+    xyz = point_cloud[..., :3]
+    valid = numpy.isfinite(xyz).all(axis=-1)
+    mask = gpu_depth_mask(point_cloud)
+    if mask is not None:
+        valid = valid & (mask > 0)
+    pts = xyz[valid]
+    if pts.shape[0] < 150:
+        pts = xyz[numpy.isfinite(xyz).all(axis=-1)]
+    if pts.shape[0] < 100:
+        return numpy.zeros((0, 3), dtype=numpy.float64)
+    pts_m, _ = points_to_meters_open3d(pts)
+    return pts_m.astype(numpy.float64)
+
+
+def extract_dense_cluster_points(
+    full_pts_m: numpy.ndarray,
+    cluster: o3d.geometry.PointCloud,
+    margin_m: float = DENSE_CROP_MARGIN_M,
+) -> numpy.ndarray:
+    """Crop full-resolution cloud to a loose AABB around the segmented cluster."""
+    pts = numpy.asarray(cluster.points, dtype=numpy.float64)
+    if pts.shape[0] == 0:
+        return pts
+    lo = numpy.min(pts, axis=0) - margin_m
+    hi = numpy.max(pts, axis=0) + margin_m
+    m = numpy.all((full_pts_m >= lo) & (full_pts_m <= hi), axis=1)
+    dense = full_pts_m[m]
+    if dense.shape[0] < 45:
+        return pts
+    return dense
+
+
+def classify_nominal_edge(
     pts: numpy.ndarray,
     plane_model: numpy.ndarray,
     camera_pose: numpy.ndarray,
 ) -> float:
     """
-    Blend vertical span with OBB median edge, clamp, then snap to 22.5 / 25 / 30 mm.
+    Combine multiple geometric cues, then snap to exactly 22.5 / 25 / 30 mm.
     """
     pm = flip_plane_to_robot_up(plane_model, camera_pose)
     h = _signed_plane_dist(pts, pm)
@@ -123,19 +320,59 @@ def estimate_cube_edge_m(
     obb = pcd.get_oriented_bounding_box()
     ext = numpy.sort(numpy.asarray(obb.extent))
     med_edge = float(numpy.median(ext))
-    edge = 0.52 * span_v + 0.48 * med_edge
-    edge = float(numpy.clip(edge, EDGE_MIN_M, EDGE_MAX_M))
-    return snap_edge_to_nominal(edge)
+
+    n = pm[:3] / (numpy.linalg.norm(pm[:3]) + 1e-12)
+    e1, e2 = _in_plane_basis(n)
+    p_plane = _project_points_to_plane(pts, pm)
+    pref = numpy.median(p_plane, axis=0)
+    rel = p_plane - pref[None, :]
+    u = numpy.dot(rel, e1)
+    v = numpy.dot(rel, e2)
+    uv = numpy.stack([u, v], axis=1).astype(numpy.float32)
+    rect_w, rect_h = 0.05, 0.05
+    if uv.shape[0] >= 5:
+        _rect = cv2.minAreaRect(uv)
+        rect_w, rect_h = float(_rect[1][0]), float(_rect[1][1])
+        if rect_w < rect_h:
+            rect_w, rect_h = rect_h, rect_w
+    foot = 0.5 * (rect_w + rect_h) if rect_w > 1e-6 else med_edge
+
+    pooled = float(numpy.median(numpy.array([span_v, med_edge, foot], dtype=numpy.float64)))
+    pooled = float(numpy.clip(pooled, EDGE_MIN_M, EDGE_MAX_M))
+    return snap_edge_to_nominal(pooled)
 
 
-def physical_cube_pose_with_edge(
+def _refine_center_aabb(pts: numpy.ndarray, R: numpy.ndarray, c0: numpy.ndarray, iters: int) -> numpy.ndarray:
+    """Center the point cloud in the cube frame (symmetric AABB)."""
+    c = c0.copy()
+    for _ in range(iters):
+        q = R.T @ (pts - c[None, :]).T
+        delta = numpy.array(
+            [0.5 * (float(numpy.min(q[k])) + float(numpy.max(q[k]))) for k in range(3)],
+            dtype=numpy.float64,
+        )
+        if float(numpy.linalg.norm(delta)) < 1e-8:
+            break
+        c = c + R @ delta
+    return c
+
+
+def _signed_height_point(c: numpy.ndarray, pm: numpy.ndarray) -> float:
+    """Signed distance of point ``c`` to plane ax+by+cz+d=0."""
+    return float(c[0] * pm[0] + c[1] * pm[1] + c[2] * pm[2] + pm[3])
+
+
+def precise_cube_pose_nominal(
     pts: numpy.ndarray,
     plane_model: numpy.ndarray,
     camera_pose: numpy.ndarray,
     edge_m: float,
 ) -> tuple[numpy.ndarray, numpy.ndarray] | None:
-    """Same as orientation_RRC physical pose but uses measured ``edge_m`` for half-height."""
-    if pts.shape[0] < 30:
+    """
+    Full geometry with **fixed** nominal edge ``edge_m``: table bottom + yaw from
+    full footprint + AABB refinement + vertical anchor to ``h_bottom + edge/2``.
+    """
+    if pts.shape[0] < 35:
         return None
 
     pm = flip_plane_to_robot_up(plane_model, camera_pose)
@@ -145,25 +382,22 @@ def physical_cube_pose_with_edge(
     h = _signed_plane_dist(pts, pm)
     h_min = float(numpy.min(h))
     h_max = float(numpy.max(h))
-    span = h_max - h_min
-    if span < 1e-6:
+    if h_max - h_min < 1e-6:
         return None
 
-    thresh = h_min + BOTTOM_LAYER_FRAC * span
+    thresh = h_min + BOTTOM_LAYER_FRAC * (h_max - h_min)
     bottom_mask = h <= thresh
+    if int(numpy.sum(bottom_mask)) < 10:
+        bottom_mask = h <= numpy.percentile(h, 20.0)
     if int(numpy.sum(bottom_mask)) < 8:
-        thresh = numpy.percentile(h, 18.0)
-        bottom_mask = h <= thresh
-    if int(numpy.sum(bottom_mask)) < 5:
         bottom_mask = numpy.ones(pts.shape[0], dtype=bool)
 
     p_plane_all = _project_points_to_plane(pts, pm)
     p_bot = p_plane_all[bottom_mask]
-
     c_bottom = numpy.median(p_bot, axis=0)
     center = c_bottom + (edge_m * 0.5) * n
 
-    rel = p_bot - c_bottom[None, :]
+    rel = p_plane_all - numpy.median(p_plane_all, axis=0)[None, :]
     u = numpy.dot(rel, e1)
     v = numpy.dot(rel, e2)
     uv = numpy.stack([u, v], axis=1).astype(numpy.float32)
@@ -184,19 +418,16 @@ def physical_cube_pose_with_edge(
     x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
     y_axis = numpy.cross(n, x_axis)
     y_axis = y_axis / (numpy.linalg.norm(y_axis) + 1e-12)
-
     R = orthonormalize_rotation(numpy.column_stack([x_axis, y_axis, n]))
 
-    c = center.copy()
-    for _ in range(BOUND_CENTER_ITERS):
-        q = R.T @ (pts - c[None, :]).T
-        delta = numpy.array(
-            [0.5 * (float(numpy.min(q[k])) + float(numpy.max(q[k]))) for k in range(3)],
-            dtype=numpy.float64,
-        )
-        if float(numpy.linalg.norm(delta)) < 1e-7:
-            break
-        c = c + R @ delta
+    c = _refine_center_aabb(pts, R, center, REFINE_AABB_ITERS)
+
+    h_bottom = float(numpy.percentile(h, 6.0))
+    h_target_center = h_bottom + edge_m * 0.5
+    h_c = _signed_height_point(c, pm)
+    c = c + n * (h_target_center - h_c)
+
+    c = _refine_center_aabb(pts, R, c, REFINE_AABB_ITERS_POST_VERTICAL)
 
     t_cam_cube = numpy.eye(4, dtype=numpy.float64)
     t_cam_cube[:3, :3] = R
@@ -207,6 +438,30 @@ def physical_cube_pose_with_edge(
     return t_robot_cube, t_cam_cube
 
 
+def average_rotation_matrices(Rs: list[numpy.ndarray]) -> numpy.ndarray:
+    """Mean rotation on SO(3) via quaternion average (sign-aligned)."""
+    if not Rs:
+        return numpy.eye(3)
+    if len(Rs) == 1:
+        return numpy.asarray(Rs[0], dtype=numpy.float64)
+    mats = numpy.stack([orthonormalize_rotation(numpy.asarray(R, dtype=numpy.float64)) for R in Rs], axis=0)
+    quats = Rotation.from_matrix(mats).as_quat()
+    ref = quats[0].copy()
+    aligned = numpy.empty_like(quats)
+    aligned[0] = ref
+    for i in range(1, quats.shape[0]):
+        q = quats[i].copy()
+        if numpy.dot(ref, q) < 0.0:
+            q = -q
+        aligned[i] = q
+    q_mean = numpy.mean(aligned, axis=0)
+    nrm = numpy.linalg.norm(q_mean)
+    if nrm < 1e-12:
+        return mats[0]
+    q_mean /= nrm
+    return Rotation.from_quat(q_mean).as_matrix()
+
+
 def detect_all_cubes_adaptive(
     observation,
     camera_intrinsic,
@@ -214,23 +469,21 @@ def detect_all_cubes_adaptive(
     max_cubes: int = MAX_CLUSTERS,
 ) -> list[dict]:
     """
-    Segment all table cubes; estimate edge per cluster; return list of dicts.
-
-    Each dict: ``t_robot``, ``t_cam``, ``edge_m`` (use as stack height increment).
+    Segment cubes; **dense** points per cluster; classify nominal edge; precise pose;
+    HSV ``color_id`` (0/1/2) from image patch at projected cube center.
     """
     image, point_cloud = observation
     if image is None or point_cloud is None:
         return []
 
-    xyz = point_cloud[..., :3]
-    valid_mask = numpy.isfinite(xyz).all(axis=-1)
-    valid_points = xyz[valid_mask]
-    if valid_points.shape[0] < 100:
+    K = numpy.asarray(camera_intrinsic, dtype=numpy.float64)
+
+    full_pts_m = points_to_scene_meters(point_cloud)
+    if full_pts_m.shape[0] < 120:
         return []
 
-    valid_points_m, _ = points_to_meters_open3d(valid_points)
     pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(valid_points_m)
+    pcd.points = o3d.utility.Vector3dVector(full_pts_m)
 
     cube_pcds, _msg, plane_np = isolate_cube_cluster_open3d(pcd, num_cubes=max_cubes)
     if not cube_pcds or plane_np is None:
@@ -238,21 +491,22 @@ def detect_all_cubes_adaptive(
 
     out: list[dict] = []
     for c in cube_pcds:
-        pts = numpy.asarray(c.points, dtype=numpy.float64)
+        pts = extract_dense_cluster_points(full_pts_m, c)
+        if pts.shape[0] < 35:
+            pts = numpy.asarray(c.points, dtype=numpy.float64)
         if pts.shape[0] < 30:
             continue
-        edge_m = estimate_cube_edge_m(pts, plane_np, camera_pose)
-        pose_pair = physical_cube_pose_with_edge(pts, plane_np, camera_pose, edge_m)
+        edge_m = classify_nominal_edge(pts, plane_np, camera_pose)
+        pose_pair = precise_cube_pose_nominal(pts, plane_np, camera_pose, edge_m)
         if pose_pair is None:
             continue
         t_robot, t_cam = pose_pair
-        out.append(
-            {
-                "t_robot": t_robot,
-                "t_cam": t_cam,
-                "edge_m": edge_m,
-            }
-        )
+        uv = cam_center_to_pixel(t_cam, K)
+        if uv is not None:
+            color_id = color_id_from_image_patch(image, uv[0], uv[1])
+        else:
+            color_id = 0
+        out.append({"t_robot": t_robot, "t_cam": t_cam, "edge_m": edge_m, "color_id": int(color_id)})
     return out
 
 
@@ -264,7 +518,7 @@ def detect_all_cubes_adaptive_fused(
     dt_s: float = POSE_SAMPLE_DT_S,
     max_cubes: int = MAX_CLUSTERS,
 ) -> list[dict]:
-    """Fuse a few frames: median edge per cluster index after sorting by edge."""
+    """Fuse frames: quaternion-mean rotation, median translation, snapped edge."""
     obs = observation
     runs: list[list[dict]] = []
     for _ in range(max(1, n_samples)):
@@ -276,12 +530,13 @@ def detect_all_cubes_adaptive_fused(
     if not runs or not runs[0]:
         return []
 
-    # Match by greedy nearest-neighbor in XY (robot frame) across frames
     base = sorted(runs[0], key=lambda d: -d["edge_m"])
-    fused = []
-    for j, det in enumerate(base):
+    fused: list[dict] = []
+    for det in base:
         edges = [det["edge_m"]]
-        tr = [det["t_robot"]]
+        colors = [int(det.get("color_id", 0))]
+        Rs = [det["t_robot"][:3, :3]]
+        positions = [det["t_robot"][:3, 3]]
         xy0 = det["t_robot"][:2, 3]
         for run in runs[1:]:
             if not run:
@@ -296,19 +551,19 @@ def detect_all_cubes_adaptive_fused(
                     best = other
             if best is not None and best_d < 0.06:
                 edges.append(best["edge_m"])
-                tr.append(best["t_robot"])
-        edge_m = float(numpy.median(edges))
-        pos = numpy.median(numpy.stack([t[:3, 3] for t in tr], axis=0), axis=0)
-        t_r = numpy.copy(tr[0])
+                colors.append(int(best.get("color_id", 0)))
+                Rs.append(best["t_robot"][:3, :3])
+                positions.append(best["t_robot"][:3, 3])
+        edge_m = snap_edge_to_nominal(float(numpy.median(edges)))
+        uq, cnt = numpy.unique(colors, return_counts=True)
+        color_id = int(uq[int(numpy.argmax(cnt))])
+        Rm = average_rotation_matrices(Rs)
+        pos = numpy.median(numpy.stack(positions, axis=0), axis=0)
+        t_r = numpy.eye(4, dtype=numpy.float64)
+        t_r[:3, :3] = Rm
         t_r[:3, 3] = pos
         t_cam = camera_pose @ t_r
-        fused.append(
-            {
-                "t_robot": t_r,
-                "t_cam": t_cam,
-                "edge_m": edge_m,
-            }
-        )
+        fused.append({"t_robot": t_r, "t_cam": t_cam, "edge_m": edge_m, "color_id": color_id})
     return fused
 
 
@@ -412,13 +667,14 @@ def run_challenge_o2_irregular(
     arm,
     zed,
     *,
-    max_cubes: int = 10,
+    max_cubes: int = TOTAL_CUBES,
     time_limit_s: float = 120.0,
     dry_run_preview: bool = True,
 ) -> int:
     """
-    Irregular tower: each iteration grabs the **largest remaining** cube (by
-    estimated edge). Stack top advances by that cube's ``edge_m``.
+    **Nine-cube** arena: AprilTag calibration, fused pose + color. Stack order is
+    **large tier (3 colors, left→right on table)**, then **medium**, then **small**
+    — biggest physical tier at the bottom of the tower, smallest on top.
     """
     camera_intrinsic = zed.camera_intrinsic
     cv_image = zed.image
@@ -437,13 +693,19 @@ def run_challenge_o2_irregular(
         if not dets:
             print("Preview: no cubes detected.")
             return 0
+        col_order = board_color_order_left_to_right(dets)
+        plan = build_stack_plan(col_order)
         dets.sort(key=lambda d: -d["edge_m"])
         disp = cv_image.copy()
         for det in dets:
             draw_pose_axes(disp, camera_intrinsic, det["t_cam"])
+        plan_str = " | ".join([f"{e * 1000:.0f}mm c{c}" for e, c in plan[:6]])
+        plan_str2 = " | ".join([f"{e * 1000:.0f}mm c{c}" for e, c in plan[6:9]])
         lines = [
-            f"o2_RRC: {len(dets)} cubes (largest edge ≈ {dets[0]['edge_m']:.3f} m)",
-            "Press k to run largest-first stack, any other key to abort",
+            f"o2_RRC: {len(dets)} cubes  colors L→R (id): {col_order}",
+            f"Plan (9): {plan_str}",
+            plan_str2,
+            "Press k to run planned stack, any other key to abort",
         ]
         disp = draw_status_overlay(disp, lines, (0, 220, 0))
         cv2.namedWindow("o2_RRC", cv2.WINDOW_NORMAL)
@@ -460,6 +722,7 @@ def run_challenge_o2_irregular(
     table_z_m: float | None = None
     # z of top face of the stack at TOWER_X_M, TOWER_Y_M (starts at table)
     tower_top_z_m: float | None = None
+    stack_plan: list[tuple[float, int]] | None = None
 
     for _ in range(max_cubes):
         if time.time() - start > time_limit_s:
@@ -479,9 +742,23 @@ def run_challenge_o2_irregular(
             print("No cubes left or detect failed.")
             break
 
-        # Largest estimated cube first (bottom of tower first in time)
-        dets.sort(key=lambda d: -d["edge_m"])
-        pick = dets[0]
+        if stack_plan is None:
+            stack_plan = build_stack_plan(board_color_order_left_to_right(dets))
+
+        step = int(placed)
+        if step >= len(stack_plan):
+            break
+        target_edge, target_color = stack_plan[step]
+        pick = pick_matching_cube(dets, target_edge, target_color)
+        if pick is None:
+            print(
+                f"Plan step {step + 1}/9: no match for edge={target_edge:.4f} color={target_color}; "
+                "fallback: largest remaining."
+            )
+            pick = pick_largest_fallback(dets)
+        if pick is None:
+            break
+
         t_src = pick["t_robot"]
         h_m = float(pick["edge_m"])
         z_c = float(t_src[2, 3])
@@ -529,7 +806,7 @@ def main():
         n = run_challenge_o2_irregular(
             arm,
             zed,
-            max_cubes=10,
+            max_cubes=TOTAL_CUBES,
             time_limit_s=120.0,
             dry_run_preview=True,
         )
