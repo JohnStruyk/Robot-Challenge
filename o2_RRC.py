@@ -3,10 +3,10 @@ o2_RRC — challenge 2 (minimal): AprilTag (checkpoint0), cluster cubes, snap ed
 22.5 / 25 / 30 mm.
 
 **Cube pose** — ``orientation_RRC.physical_cube_pose_from_points`` (RANSAC table plane,
-bottom footprint, min-area yaw, bound centering in camera frame), then **extra**
-bound-centering iterations in ``o2_RRC``, then **snap** the center along the table
-normal so signed height matches ``h_min + edge/2`` (fixes depth drift). All in the
-same world frame as AprilTag PnP — **no** hardcoded robot ``[0,0,1]`` cube axis.
+bottom footprint, min-area yaw, bound centering), then extra AABB passes and **height snap**
+along the table normal. **30 mm (large) cubes**: thinner bottom-layer mask, more bound
+iterations, **4th-percentile** contact height (vs raw min), wider dense crop, and **two**
+refine↔snap cycles. Same AprilTag / world frame as PnP.
 
 **Play area**: Dense points and detections are cropped to the **white mat** in world
 frame — the axis-aligned rectangle spanned by the **four** AprilTag centers in
@@ -90,8 +90,19 @@ TOTAL_CUBES = 9
 GPU_Z_MIN_M = 0.28
 GPU_Z_MAX_M = 1.4
 DENSE_CROP_MARGIN_M = 0.008
+# Larger clusters (~30 mm cubes) need a wider dense crop so sides/top contribute to pose.
+LARGE_DENSE_CROP_MARGIN_M = 0.012
+LARGE_CLUSTER_MIN_EXTENT_M = 0.027
 # Extra AABB-in-cube-frame passes after physical_cube_pose_from_points (orientation already uses BOUND_CENTER_ITERS).
 POSE_BOUND_CENTER_EXTRA_ITERS = 4
+POSE_BOUND_CENTER_EXTRA_ITERS_LARGE = 8
+# Large cubes: thinner bottom slice + more bound iterations inside physical_cube_pose_from_points.
+LARGE_BOTTOM_LAYER_FRAC = 0.14
+LARGE_PHYSICAL_BOUND_ITERS = 6
+# Signed-height contact: use low percentile instead of min to ignore depth speckle (large cubes).
+LARGE_H_CONTACT_PERCENTILE = 4.0
+# Alternate refine ↔ height snap for large cubes (tighter convergence).
+LARGE_POSE_REFINE_SNAP_CYCLES = 2
 
 # White play mat = axis-aligned rectangle through the four AprilTag centers (world XY, meters).
 _TAG_CENTERS_XY = numpy.asarray(TAG_CENTER_COORDINATES, dtype=numpy.float64)
@@ -190,6 +201,18 @@ def cluster_median_robot(
     return numpy.median(pr, axis=0)
 
 
+def dense_margin_for_cluster(cluster: o3d.geometry.PointCloud) -> float:
+    """Wider crop for physically large clusters (≈30 mm) so more surface points are used."""
+    try:
+        obb = cluster.get_oriented_bounding_box()
+        ext = numpy.sort(numpy.asarray(obb.extent))
+        if ext.size >= 3 and float(ext[2]) >= LARGE_CLUSTER_MIN_EXTENT_M:
+            return LARGE_DENSE_CROP_MARGIN_M
+    except Exception:
+        pass
+    return DENSE_CROP_MARGIN_M
+
+
 def extract_dense_cluster_points(
     full_pts_m: numpy.ndarray,
     cluster: o3d.geometry.PointCloud,
@@ -270,18 +293,29 @@ def snap_cube_center_along_plane_normal(
     plane_model: numpy.ndarray,
     camera_pose: numpy.ndarray,
     edge_m: float,
+    *,
+    h_contact_percentile: float = 0.0,
 ) -> numpy.ndarray:
     """
-    Move center along the table normal so signed plane distance matches ``h_min + edge/2``
-    (cube center halfway above the lowest surface samples).
+    Move center along the table normal so signed plane distance matches ``h_contact + edge/2``.
+    ``h_contact`` is the reference height of the contact patch: ``min(h)`` by default, or
+    ``percentile(h, h_contact_percentile)`` when ``h_contact_percentile > 0`` (large cubes).
     """
     pm = flip_plane_to_robot_up(plane_model, camera_pose)
     h_pts = _signed_plane_dist(pts_cam, pm)
-    h_min = float(numpy.min(h_pts))
+    if h_contact_percentile > 0.0:
+        h_contact = float(numpy.percentile(h_pts, float(h_contact_percentile)))
+    else:
+        h_contact = float(numpy.min(h_pts))
     n = pm[:3] / (numpy.linalg.norm(pm[:3]) + 1e-12)
     h_c = float(_signed_plane_dist(center_cam.reshape(1, 3), pm)[0])
-    target_h = h_min + float(edge_m) * 0.5
+    target_h = h_contact + float(edge_m) * 0.5
     return numpy.asarray(center_cam, dtype=numpy.float64) + n * (target_h - h_c)
+
+
+def _is_nominal_large_cube(edge_m: float) -> bool:
+    """30 mm inventory — tightest grasp margin; extra pose refinement."""
+    return abs(float(edge_m) - float(CUBE_SIZE_LARGE_M)) < 1.5e-3
 
 
 def compute_cube_pose_o2(
@@ -292,17 +326,38 @@ def compute_cube_pose_o2(
 ) -> tuple[numpy.ndarray, numpy.ndarray] | None:
     """
     Table-plane physical pose, extra bound-centering, height snap along normal, robot transform.
+    Large (30 mm) cubes use a thinner bottom layer, more AABB iterations, robust contact
+    height (percentile), and multiple refine↔snap cycles.
     """
     if pts.shape[0] < 30:
         return None
-    pair = physical_cube_pose_from_points(pts, plane_model, camera_pose, edge_m)
+    large = _is_nominal_large_cube(edge_m)
+    pair = physical_cube_pose_from_points(
+        pts,
+        plane_model,
+        camera_pose,
+        edge_m,
+        bottom_layer_frac=(LARGE_BOTTOM_LAYER_FRAC if large else None),
+        bound_center_iters=(LARGE_PHYSICAL_BOUND_ITERS if large else None),
+    )
     if pair is None:
         return None
     _, t_cam = pair
-    t_cam = refine_cube_pose_bound_center_cam(pts, t_cam, POSE_BOUND_CENTER_EXTRA_ITERS)
-    c = snap_cube_center_along_plane_normal(t_cam[:3, 3], pts, plane_model, camera_pose, edge_m)
+    extra = POSE_BOUND_CENTER_EXTRA_ITERS_LARGE if large else POSE_BOUND_CENTER_EXTRA_ITERS
+    snap_pct = LARGE_H_CONTACT_PERCENTILE if large else 0.0
+    cycles = LARGE_POSE_REFINE_SNAP_CYCLES if large else 1
     t_cam = numpy.copy(t_cam)
-    t_cam[:3, 3] = c
+    for _ in range(cycles):
+        t_cam = refine_cube_pose_bound_center_cam(pts, t_cam, extra)
+        c = snap_cube_center_along_plane_normal(
+            t_cam[:3, 3],
+            pts,
+            plane_model,
+            camera_pose,
+            edge_m,
+            h_contact_percentile=snap_pct,
+        )
+        t_cam[:3, 3] = c
     T_cam_robot = numpy.asarray(camera_pose, dtype=numpy.float64)
     t_robot = numpy.linalg.inv(T_cam_robot) @ t_cam
     return t_robot, t_cam
@@ -350,7 +405,7 @@ def detect_cubes_once(
         if not is_center_on_playmat_robot(cluster_median_robot(pts_sparse, camera_pose)):
             continue
 
-        pts = extract_dense_cluster_points(full_pts_m, c)
+        pts = extract_dense_cluster_points(full_pts_m, c, margin_m=dense_margin_for_cluster(c))
         if pts.shape[0] < 35:
             pts = pts_sparse
         if pts.shape[0] < 30:

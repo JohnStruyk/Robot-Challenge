@@ -186,6 +186,9 @@ def physical_cube_pose_from_points(
     plane_model: numpy.ndarray,
     camera_pose: numpy.ndarray,
     edge_m: float | None = None,
+    *,
+    bottom_layer_frac: float | None = None,
+    bound_center_iters: int | None = None,
 ) -> tuple[numpy.ndarray, numpy.ndarray] | None:
     """
     Cube on table: bottom-face footprint + known edge length + min-area yaw + bound centering.
@@ -195,6 +198,11 @@ def physical_cube_pose_from_points(
     edge_m
         Physical cube edge (m). Pass as 4th positional or ``edge_m=``. If ``None``, uses
         ``CUBE_SIZE_M`` (25 mm challenge default).
+    bottom_layer_frac
+        Fraction of height range for bottom-face mask; default ``BOTTOM_LAYER_FRAC``.
+        Smaller values (e.g. 0.14) tighten the contact slice for large cubes.
+    bound_center_iters
+        AABB snap iterations in cube frame; default ``BOUND_CENTER_ITERS``.
 
     Returns
     -------
@@ -202,6 +210,11 @@ def physical_cube_pose_from_points(
     """
     if pts.shape[0] < 30:
         return None
+
+    blf = float(BOTTOM_LAYER_FRAC if bottom_layer_frac is None else bottom_layer_frac)
+    blf = float(numpy.clip(blf, 0.06, 0.45))
+    bci = int(BOUND_CENTER_ITERS if bound_center_iters is None else bound_center_iters)
+    bci = max(1, min(bci, 24))
 
     pm = numpy.asarray(plane_model, dtype=numpy.float64).copy()
     R_cam_robot = camera_pose[:3, :3]
@@ -223,7 +236,7 @@ def physical_cube_pose_from_points(
         return None
 
     # Bottom face: points closest to the table (reduces forward / perspective bias)
-    thresh = h_min + BOTTOM_LAYER_FRAC * span
+    thresh = h_min + blf * span
     bottom_mask = h <= thresh
     if int(numpy.sum(bottom_mask)) < 8:
         thresh = numpy.percentile(h, 18.0)
@@ -266,7 +279,7 @@ def physical_cube_pose_from_points(
 
     # Snap center so the cloud is centered in the cube frame (fixes systematic offset)
     c = center.copy()
-    for _ in range(BOUND_CENTER_ITERS):
+    for _ in range(bci):
         q = R.T @ (pts - c[None, :]).T
         delta = numpy.array(
             [0.5 * (float(numpy.min(q[k])) + float(numpy.max(q[k]))) for k in range(3)],
