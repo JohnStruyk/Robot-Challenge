@@ -11,7 +11,7 @@ measured cloud — this refines **position + orientation** for the actual camera
 and play-mat geometry without hand-tuned cardinal snaps.
 
 **Route**: Largest → smallest; match by **nominal** edge + nearest XY. **Grasp**: yaw
-snapped to 90°, speed 10 from first cube-level height through wiggle and final close.
+snapped to 90°, speed ≥50 at cube level; pose uses size-aware footprint centroid for tight XY on large cubes.
 """
 from __future__ import annotations
 
@@ -68,10 +68,10 @@ ARM_SPEED_TRAVEL = 1200
 ARM_SPEED_APPROACH = 320
 ARM_SPEED_PLACE_FINAL = 70
 ARM_SPEED_LIFT = 1000
-# Grasp: extremely slow (10) from first arrival at cube height through wiggle and final plunge.
-ARM_SPEED_GRASP_CUBE_LEVEL = 10
-ARM_SPEED_GRASP_DESCEND_FINAL = 10
-ARM_SPEED_GRASP_WIGGLE = 10
+# Grasp: slow at cube level (~35 mm gripper vs 30 mm cubes → need precise XY; keep ≥50).
+ARM_SPEED_GRASP_CUBE_LEVEL = 50
+ARM_SPEED_GRASP_DESCEND_FINAL = 50
+ARM_SPEED_GRASP_WIGGLE = 50
 GRASP_FINAL_APPROACH_MM = 5.0
 GRASP_WIGGLE_XY_MM = 0.9
 GRASP_WIGGLE_YAW_DEG = 1.0
@@ -112,6 +112,122 @@ ICP_MIN_FITNESS = 0.12
 # Pre-ICP physical init: single pipeline; ICP does the fine alignment.
 PHYSICAL_INIT_BOUND_EXTRA = 4
 PHYSICAL_INIT_YAW_SOURCE = "bottom"
+# Extra AABB centering in cube frame after ICP + footprint blend (large cubes need tight XY).
+BOUND_CENTER_ITERS_AFTER_ICP_SMALL = 4
+BOUND_CENTER_ITERS_AFTER_ICP_MEDIUM = 6
+BOUND_CENTER_ITERS_AFTER_ICP_LARGE = 10
+
+
+def _nominal_edge_bucket(edge_m: float) -> str:
+    e = float(edge_m)
+    if abs(e - float(CUBE_SIZE_LARGE_M)) < 1.5e-3:
+        return "large"
+    if abs(e - float(CUBE_SIZE_SMALL_M)) < 1.5e-3:
+        return "small"
+    return "medium"
+
+
+def bottom_slice_height_fraction_for_edge(edge_m: float) -> float:
+    """
+    Fraction of cluster height range used to mask bottom-face points for footprint centroid.
+    Large cubes: narrow band (true contact only). Small: wider (sparse bottom in depth).
+    """
+    b = _nominal_edge_bucket(edge_m)
+    if b == "large":
+        return 0.10
+    if b == "small":
+        return 0.24
+    return 0.18
+
+
+def footprint_translation_blend_weight(edge_m: float) -> float:
+    """
+    Weight on table-plane footprint centroid vs ICP translation. ~35 mm gripper on 30 mm
+    cubes needs nearly full footprint trust for large; small clouds blend more with ICP.
+    """
+    b = _nominal_edge_bucket(edge_m)
+    if b == "large":
+        return 0.92
+    if b == "small":
+        return 0.38
+    return 0.48
+
+
+def cube_center_from_bottom_footprint(
+    pts_cam: numpy.ndarray,
+    plane_model: numpy.ndarray,
+    camera_pose: numpy.ndarray,
+    edge_m: float,
+) -> numpy.ndarray:
+    """
+    Geometric cube center from bottom-face footprint: centroid of points projected onto the
+    table plane, then offset along the plane normal by h_contact + edge/2 (same h_contact
+    rule as ``snap_cube_center_along_plane_normal``).
+    """
+    pm = flip_plane_to_robot_up(plane_model, camera_pose)
+    n = pm[:3] / (numpy.linalg.norm(pm[:3]) + 1e-12)
+    h_pts = _signed_plane_dist(pts_cam, pm)
+    h_min = float(numpy.min(h_pts))
+    h_max = float(numpy.max(h_pts))
+    span = max(h_max - h_min, 1e-9)
+    frac = bottom_slice_height_fraction_for_edge(edge_m)
+    mask = h_pts <= h_min + span * frac
+    if int(numpy.sum(mask)) < 8:
+        mask = h_pts <= h_min + span * max(frac, 0.28)
+    p = pts_cam[mask]
+    sd = _signed_plane_dist(p, pm)
+    p_proj = p - sd[:, numpy.newaxis] * n[numpy.newaxis, :]
+    c_flat = numpy.mean(p_proj, axis=0)
+    hp = h_contact_percentile_for_edge(edge_m)
+    if hp > 0.0:
+        h_contact = float(numpy.percentile(h_pts, float(hp)))
+    else:
+        h_contact = float(numpy.min(h_pts))
+    return c_flat + n * (h_contact + float(edge_m) * 0.5)
+
+
+def refine_translation_footprint_icp_blend(
+    t_cam_cube: numpy.ndarray,
+    pts_cam: numpy.ndarray,
+    plane_model: numpy.ndarray,
+    camera_pose: numpy.ndarray,
+    edge_m: float,
+) -> numpy.ndarray:
+    """Blend footprint-based center with ICP translation, then re-snap height along plane normal."""
+    w = footprint_translation_blend_weight(edge_m)
+    c_foot = cube_center_from_bottom_footprint(pts_cam, plane_model, camera_pose, edge_m)
+    c_icp = numpy.asarray(t_cam_cube[:3, 3], dtype=numpy.float64)
+    c_blend = w * c_foot + (1.0 - w) * c_icp
+    c_snap = snap_cube_center_along_plane_normal(
+        c_blend,
+        pts_cam,
+        plane_model,
+        camera_pose,
+        edge_m,
+        h_contact_percentile=h_contact_percentile_for_edge(edge_m),
+    )
+    out = numpy.copy(t_cam_cube)
+    out[:3, 3] = c_snap
+    return out
+
+
+def _icp_tuning_for_edge(edge_m: float) -> tuple[float, float, int, int]:
+    """(voxel_m, max_corr_fine_m, coarse_iters, fine_iters) — tighter for 30 mm (gripper margin)."""
+    b = _nominal_edge_bucket(edge_m)
+    if b == "large":
+        return 0.0018, 0.0045, 68, 58
+    if b == "small":
+        return 0.0030, 0.0080, 48, 38
+    return ICP_VOXEL_M, ICP_MAX_CORR_FINE_M, ICP_COARSE_ITERS, ICP_FINE_ITERS
+
+
+def bound_center_iters_after_icp(edge_m: float) -> int:
+    b = _nominal_edge_bucket(edge_m)
+    if b == "large":
+        return BOUND_CENTER_ITERS_AFTER_ICP_LARGE
+    if b == "small":
+        return BOUND_CENTER_ITERS_AFTER_ICP_SMALL
+    return BOUND_CENTER_ITERS_AFTER_ICP_MEDIUM
 
 
 def dense_margin_for_nominal_edge(edge_m: float) -> float:
@@ -325,19 +441,20 @@ def icp_refine_cube_pose_cam(
     """
     Refine cube pose in camera frame: register a synthetic ``edge_m`` cube mesh (centered
     at origin in cube frame) to the measured cluster via Open3D ICP. Handles oblique views
-    without snapping to mat cardinals.
+    without snapping to mat cardinals. Voxel / fine correspondence tightened for 30 mm cubes.
     """
     em = float(edge_m)
     T0 = numpy.asarray(t_cam_init, dtype=numpy.float64)
     if em < 1e-4 or pts_cam.shape[0] < 25:
         return T0
+    voxel_m, corr_fine_m, coarse_iters, fine_iters = _icp_tuning_for_edge(edge_m)
     mesh = o3d.geometry.TriangleMesh.create_box(em, em, em)
     mesh.translate(-numpy.array([em * 0.5, em * 0.5, em * 0.5], dtype=numpy.float64))
     n_src = min(ICP_MESH_SAMPLES, max(500, int(pts_cam.shape[0] * 30)))
     source = mesh.sample_points_uniformly(number_of_points=n_src)
     target = o3d.geometry.PointCloud()
     target.points = o3d.utility.Vector3dVector(pts_cam.astype(numpy.float64))
-    target_ds = target.voxel_down_sample(voxel_size=ICP_VOXEL_M)
+    target_ds = target.voxel_down_sample(voxel_size=float(voxel_m))
     if len(target_ds.points) < 20:
         target_ds = target
     try:
@@ -349,7 +466,7 @@ def icp_refine_cube_pose_cam(
     criteria_coarse = o3d.pipelines.registration.ICPConvergenceCriteria(
         relative_fitness=1e-6,
         relative_rmse=1e-6,
-        max_iteration=ICP_COARSE_ITERS,
+        max_iteration=int(coarse_iters),
     )
     try:
         reg1 = o3d.pipelines.registration.registration_icp(
@@ -372,12 +489,12 @@ def icp_refine_cube_pose_cam(
             T[:3, :3] = orthonormalize_rotation(T[:3, :3])
             return T
         criteria_fine = o3d.pipelines.registration.ICPConvergenceCriteria(
-            max_iteration=ICP_FINE_ITERS,
+            max_iteration=int(fine_iters),
         )
         reg2 = o3d.pipelines.registration.registration_icp(
             source,
             target_ds,
-            ICP_MAX_CORR_FINE_M,
+            float(corr_fine_m),
             T1,
             o3d.pipelines.registration.TransformationEstimationPointToPlane(),
             criteria_fine,
@@ -448,7 +565,9 @@ def compute_cube_pose_o2(
     """
     Seed pose from ``physical_cube_pose_from_points`` (table plane + footprint), one
     bound-center + height snap along the plane normal, then **Open3D ICP** (synthetic cube
-    mesh → cloud) for position and orientation at the real camera angle.
+    mesh → cloud). **Translation** is then blended with a **table-plane footprint centroid**
+    (size-dependent weight; large cubes → ~92% footprint for ~35 mm gripper vs 30 mm stock),
+    extra AABB centering in cube frame, then robot pose.
     """
     if pts.shape[0] < 30:
         return None
@@ -474,6 +593,10 @@ def compute_cube_pose_o2(
     )
     t_cam[:3, 3] = c
     t_cam = icp_refine_cube_pose_cam(pts, t_cam, edge_m)
+    t_cam = refine_translation_footprint_icp_blend(
+        t_cam, pts, plane_model, camera_pose, edge_m
+    )
+    t_cam = refine_cube_pose_bound_center_cam(pts, t_cam, bound_center_iters_after_icp(edge_m))
     T_cam_robot = numpy.asarray(camera_pose, dtype=numpy.float64)
     t_robot = numpy.linalg.inv(T_cam_robot) @ t_cam
     return t_robot, t_cam
