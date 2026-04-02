@@ -2,11 +2,11 @@
 o2_RRC — challenge 2 (minimal): AprilTag (checkpoint0), cluster cubes, snap edge to
 22.5 / 25 / 30 mm.
 
-**Cube pose** — ``orientation_RRC.physical_cube_pose_from_points`` (RANSAC table plane,
-bottom footprint, min-area yaw, bound centering), then extra AABB passes and **height snap**
-along the table normal. **30 mm (large) cubes**: thinner bottom-layer mask, more bound
-iterations, **4th-percentile** contact height (vs raw min), wider dense crop, and **two**
-refine↔snap cycles. Same AprilTag / world frame as PnP.
+**Cube pose** — ``orientation_RRC.physical_cube_pose_from_points`` with **adaptive**
+parameters per nominal size (22.5 / 25 / 30 mm): bottom-layer fraction, bound iterations,
+``yaw_source`` (bottom vs full projected footprint vs blend), contact height percentile,
+refine↔snap cycles, and a **second** dense crop with size-specific margin after edge
+classification. Same AprilTag / world frame as PnP.
 
 **Play area**: Dense points and detections are cropped to the **white mat** in world
 frame — the axis-aligned rectangle spanned by the **four** AprilTag centers in
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import NamedTuple
 import time
 import traceback
 
@@ -90,19 +91,73 @@ TOTAL_CUBES = 9
 GPU_Z_MIN_M = 0.28
 GPU_Z_MAX_M = 1.4
 DENSE_CROP_MARGIN_M = 0.008
-# Larger clusters (~30 mm cubes) need a wider dense crop so sides/top contribute to pose.
+# Per-size dense re-crop after nominal edge is known (meters).
+SMALL_DENSE_CROP_MARGIN_M = 0.006
+MEDIUM_DENSE_CROP_MARGIN_M = 0.008
+# Larger clusters (~30 mm) need a wider crop so sides/top contribute to pose.
 LARGE_DENSE_CROP_MARGIN_M = 0.012
 LARGE_CLUSTER_MIN_EXTENT_M = 0.027
-# Extra AABB-in-cube-frame passes after physical_cube_pose_from_points (orientation already uses BOUND_CENTER_ITERS).
-POSE_BOUND_CENTER_EXTRA_ITERS = 4
-POSE_BOUND_CENTER_EXTRA_ITERS_LARGE = 8
-# Large cubes: thinner bottom slice + more bound iterations inside physical_cube_pose_from_points.
-LARGE_BOTTOM_LAYER_FRAC = 0.14
-LARGE_PHYSICAL_BOUND_ITERS = 6
-# Signed-height contact: use low percentile instead of min to ignore depth speckle (large cubes).
-LARGE_H_CONTACT_PERCENTILE = 4.0
-# Alternate refine ↔ height snap for large cubes (tighter convergence).
-LARGE_POSE_REFINE_SNAP_CYCLES = 2
+
+
+class CubePoseParams(NamedTuple):
+    """Adaptive pose/orientation pipeline for one nominal cube size."""
+
+    bottom_layer_frac: float | None  # None → orientation_RRC.BOTTOM_LAYER_FRAC
+    bound_center_iters: int | None  # None → orientation_RRC.BOUND_CENTER_ITERS
+    extra_bound_iters: int
+    h_contact_percentile: float  # 0 = use min(h); else percentile for contact height
+    refine_snap_cycles: int
+    yaw_source: str  # bottom | full | blend (see physical_cube_pose_from_points)
+
+
+# 22.5 mm: sparse cloud — thicker bottom band, yaw from full projected footprint, tight crop, robust contact.
+POSE_PARAMS_SMALL = CubePoseParams(
+    bottom_layer_frac=0.28,
+    bound_center_iters=5,
+    extra_bound_iters=5,
+    h_contact_percentile=1.0,
+    refine_snap_cycles=2,
+    yaw_source="full",
+)
+# 25 mm: default orientation_RRC behavior.
+POSE_PARAMS_MEDIUM = CubePoseParams(
+    bottom_layer_frac=None,
+    bound_center_iters=None,
+    extra_bound_iters=4,
+    h_contact_percentile=0.0,
+    refine_snap_cycles=1,
+    yaw_source="bottom",
+)
+# 30 mm: thin contact slice, many iterations, percentile contact height, yaw from bottom face.
+POSE_PARAMS_LARGE = CubePoseParams(
+    bottom_layer_frac=0.14,
+    bound_center_iters=6,
+    extra_bound_iters=8,
+    h_contact_percentile=4.0,
+    refine_snap_cycles=2,
+    yaw_source="bottom",
+)
+
+
+def pose_params_for_nominal_edge(edge_m: float) -> CubePoseParams:
+    e = float(edge_m)
+    if abs(e - float(CUBE_SIZE_SMALL_M)) < 1.5e-3:
+        return POSE_PARAMS_SMALL
+    if abs(e - float(CUBE_SIZE_MEDIUM_M)) < 1.5e-3:
+        return POSE_PARAMS_MEDIUM
+    if abs(e - float(CUBE_SIZE_LARGE_M)) < 1.5e-3:
+        return POSE_PARAMS_LARGE
+    return POSE_PARAMS_MEDIUM
+
+
+def dense_margin_for_nominal_edge(edge_m: float) -> float:
+    """Second-pass crop margin after ``classify_nominal_edge`` (size-aware)."""
+    e = float(edge_m)
+    if abs(e - float(CUBE_SIZE_SMALL_M)) < 1.5e-3:
+        return SMALL_DENSE_CROP_MARGIN_M
+    if abs(e - float(CUBE_SIZE_LARGE_M)) < 1.5e-3:
+        return LARGE_DENSE_CROP_MARGIN_M
+    return MEDIUM_DENSE_CROP_MARGIN_M
 
 # White play mat = axis-aligned rectangle through the four AprilTag centers (world XY, meters).
 _TAG_CENTERS_XY = numpy.asarray(TAG_CENTER_COORDINATES, dtype=numpy.float64)
@@ -313,11 +368,6 @@ def snap_cube_center_along_plane_normal(
     return numpy.asarray(center_cam, dtype=numpy.float64) + n * (target_h - h_c)
 
 
-def _is_nominal_large_cube(edge_m: float) -> bool:
-    """30 mm inventory — tightest grasp margin; extra pose refinement."""
-    return abs(float(edge_m) - float(CUBE_SIZE_LARGE_M)) < 1.5e-3
-
-
 def compute_cube_pose_o2(
     pts: numpy.ndarray,
     plane_model: numpy.ndarray,
@@ -325,37 +375,34 @@ def compute_cube_pose_o2(
     edge_m: float,
 ) -> tuple[numpy.ndarray, numpy.ndarray] | None:
     """
-    Table-plane physical pose, extra bound-centering, height snap along normal, robot transform.
-    Large (30 mm) cubes use a thinner bottom layer, more AABB iterations, robust contact
-    height (percentile), and multiple refine↔snap cycles.
+    Table-plane physical pose with **size-specific** bottom mask, yaw source, iterations,
+    height snap, and refine cycles (see ``CubePoseParams``).
     """
     if pts.shape[0] < 30:
         return None
-    large = _is_nominal_large_cube(edge_m)
+    p = pose_params_for_nominal_edge(edge_m)
     pair = physical_cube_pose_from_points(
         pts,
         plane_model,
         camera_pose,
         edge_m,
-        bottom_layer_frac=(LARGE_BOTTOM_LAYER_FRAC if large else None),
-        bound_center_iters=(LARGE_PHYSICAL_BOUND_ITERS if large else None),
+        bottom_layer_frac=p.bottom_layer_frac,
+        bound_center_iters=p.bound_center_iters,
+        yaw_source=p.yaw_source,
     )
     if pair is None:
         return None
     _, t_cam = pair
-    extra = POSE_BOUND_CENTER_EXTRA_ITERS_LARGE if large else POSE_BOUND_CENTER_EXTRA_ITERS
-    snap_pct = LARGE_H_CONTACT_PERCENTILE if large else 0.0
-    cycles = LARGE_POSE_REFINE_SNAP_CYCLES if large else 1
     t_cam = numpy.copy(t_cam)
-    for _ in range(cycles):
-        t_cam = refine_cube_pose_bound_center_cam(pts, t_cam, extra)
+    for _ in range(p.refine_snap_cycles):
+        t_cam = refine_cube_pose_bound_center_cam(pts, t_cam, p.extra_bound_iters)
         c = snap_cube_center_along_plane_normal(
             t_cam[:3, 3],
             pts,
             plane_model,
             camera_pose,
             edge_m,
-            h_contact_percentile=snap_pct,
+            h_contact_percentile=p.h_contact_percentile,
         )
         t_cam[:3, 3] = c
     T_cam_robot = numpy.asarray(camera_pose, dtype=numpy.float64)
@@ -411,6 +458,11 @@ def detect_cubes_once(
         if pts.shape[0] < 30:
             continue
         edge_m = classify_nominal_edge(pts, plane_np, camera_pose)
+        pts_sz = extract_dense_cluster_points(
+            full_pts_m, c, margin_m=dense_margin_for_nominal_edge(edge_m)
+        )
+        if pts_sz.shape[0] >= 40:
+            pts = pts_sz
         pose_pair = compute_cube_pose_o2(pts, plane_np, camera_pose, edge_m)
         if pose_pair is None:
             continue

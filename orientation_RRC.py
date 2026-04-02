@@ -181,6 +181,31 @@ def _in_plane_basis(n: numpy.ndarray) -> tuple[numpy.ndarray, numpy.ndarray]:
     return e1, e2
 
 
+def _x_axis_from_plane_min_area_uv(
+    uv: numpy.ndarray,
+    e1: numpy.ndarray,
+    e2: numpy.ndarray,
+    n: numpy.ndarray,
+    fallback: numpy.ndarray,
+) -> numpy.ndarray:
+    """Unit in-plane X from ``cv2.minAreaRect`` on 2D points (u,v)."""
+    if uv.shape[0] < 5:
+        return fallback
+    rect = cv2.minAreaRect(uv.astype(numpy.float32))
+    box = cv2.boxPoints(rect).astype(numpy.float64)
+    e01 = box[1] - box[0]
+    norm_e = float(numpy.linalg.norm(e01))
+    if norm_e < 1e-9:
+        return fallback
+    du, dv = e01[0] / norm_e, e01[1] / norm_e
+    x_axis = du * e1 + dv * e2
+    x_axis = x_axis - numpy.dot(x_axis, n) * n
+    xn = numpy.linalg.norm(x_axis)
+    if xn < 1e-12:
+        return fallback
+    return x_axis / xn
+
+
 def physical_cube_pose_from_points(
     pts: numpy.ndarray,
     plane_model: numpy.ndarray,
@@ -189,6 +214,7 @@ def physical_cube_pose_from_points(
     *,
     bottom_layer_frac: float | None = None,
     bound_center_iters: int | None = None,
+    yaw_source: str = "bottom",
 ) -> tuple[numpy.ndarray, numpy.ndarray] | None:
     """
     Cube on table: bottom-face footprint + known edge length + min-area yaw + bound centering.
@@ -203,6 +229,12 @@ def physical_cube_pose_from_points(
         Smaller values (e.g. 0.14) tighten the contact slice for large cubes.
     bound_center_iters
         AABB snap iterations in cube frame; default ``BOUND_CENTER_ITERS``.
+    yaw_source
+        How to set horizontal axes from ``cv2.minAreaRect`` in the table plane:
+
+        - ``"bottom"`` — rectangle on **bottom-layer** footprint only (default).
+        - ``"full"`` — rectangle on **all** projected points (better when the bottom band is sparse).
+        - ``"blend"`` — average of bottom and full in-plane directions, then re-normalized.
 
     Returns
     -------
@@ -215,6 +247,9 @@ def physical_cube_pose_from_points(
     blf = float(numpy.clip(blf, 0.06, 0.45))
     bci = int(BOUND_CENTER_ITERS if bound_center_iters is None else bound_center_iters)
     bci = max(1, min(bci, 24))
+    yaw_src = str(yaw_source).lower().strip()
+    if yaw_src not in ("bottom", "full", "blend"):
+        yaw_src = "bottom"
 
     pm = numpy.asarray(plane_model, dtype=numpy.float64).copy()
     R_cam_robot = camera_pose[:3, :3]
@@ -252,23 +287,29 @@ def physical_cube_pose_from_points(
     # Cube center: half edge along table normal from bottom face center
     center = c_bottom + (size_m * 0.5) * n
 
-    # Yaw: min-area rectangle on bottom footprint in (u,v)
-    rel = p_bot - c_bottom[None, :]
-    u = numpy.dot(rel, e1)
-    v = numpy.dot(rel, e2)
-    uv = numpy.stack([u, v], axis=1).astype(numpy.float32)
-    if uv.shape[0] >= 5:
-        rect = cv2.minAreaRect(uv)
-        box = cv2.boxPoints(rect).astype(numpy.float64)
-        e01 = box[1] - box[0]
-        norm_e = float(numpy.linalg.norm(e01))
-        if norm_e > 1e-9:
-            du, dv = e01[0] / norm_e, e01[1] / norm_e
-            x_axis = du * e1 + dv * e2
-        else:
-            x_axis = e1
+    # Yaw: min-area rectangle in (u,v) — source depends on ``yaw_source`` (per cube size in o2_RRC).
+    rel_bot = p_bot - c_bottom[None, :]
+    u_b = numpy.dot(rel_bot, e1)
+    v_b = numpy.dot(rel_bot, e2)
+    uv_bot = numpy.stack([u_b, v_b], axis=1)
+    x_bottom = _x_axis_from_plane_min_area_uv(uv_bot, e1, e2, n, e1)
+
+    pref_all = numpy.median(p_plane_all, axis=0)
+    rel_all = p_plane_all - pref_all[None, :]
+    u_a = numpy.dot(rel_all, e1)
+    v_a = numpy.dot(rel_all, e2)
+    uv_all = numpy.stack([u_a, v_a], axis=1)
+    x_full = _x_axis_from_plane_min_area_uv(uv_all, e1, e2, n, e1)
+
+    if yaw_src == "full":
+        x_axis = x_full
+    elif yaw_src == "blend":
+        s = x_bottom + x_full
+        s = s - numpy.dot(s, n) * n
+        sn = numpy.linalg.norm(s)
+        x_axis = (s / sn) if sn > 1e-12 else x_bottom
     else:
-        x_axis = e1
+        x_axis = x_bottom
 
     x_axis = x_axis - numpy.dot(x_axis, n) * n
     x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
