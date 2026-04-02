@@ -91,7 +91,7 @@ GRIPPER_SETTLE_PLACE_S = 0.45
 RELEASE_WAIT_S = 0.45
 PLACE_SOFT_LAST_MM = 7.0
 # Additive offset after snap-to-90° yaw (systematic ~45° cube horizontal frame vs gripper).
-GRASP_YAW_OFFSET_DEG = 45.0
+GRASP_YAW_OFFSET_DEG = 0.0
 
 CUBE_SIZES_M = (CUBE_SIZE_SMALL_M, CUBE_SIZE_MEDIUM_M, CUBE_SIZE_LARGE_M)
 EDGE_MIN_M = 0.021
