@@ -11,7 +11,7 @@ measured cloud — this refines **position + orientation** for the actual camera
 and play-mat geometry without hand-tuned cardinal snaps.
 
 **Route**: Largest → smallest; match by **nominal** edge + nearest XY. **Grasp**: yaw
-snapped to 90°, slower final descent, small XY + yaw wiggle at pre-touch to seat the gripper.
+snapped to 90°, speed 10 from first cube-level height through wiggle and final close.
 """
 from __future__ import annotations
 
@@ -68,10 +68,10 @@ ARM_SPEED_TRAVEL = 1200
 ARM_SPEED_APPROACH = 320
 ARM_SPEED_PLACE_FINAL = 70
 ARM_SPEED_LIFT = 1000
-# Grasp: slower overall descent + very slow final mm + compliance wiggle at pre-touch.
-ARM_SPEED_GRASP_DESCEND = 160
-ARM_SPEED_GRASP_DESCEND_FINAL = 65
-ARM_SPEED_GRASP_WIGGLE = 50
+# Grasp: extremely slow (10) from first arrival at cube height through wiggle and final plunge.
+ARM_SPEED_GRASP_CUBE_LEVEL = 10
+ARM_SPEED_GRASP_DESCEND_FINAL = 10
+ARM_SPEED_GRASP_WIGGLE = 10
 GRASP_FINAL_APPROACH_MM = 5.0
 GRASP_WIGGLE_XY_MM = 0.9
 GRASP_WIGGLE_YAW_DEG = 1.0
@@ -667,7 +667,7 @@ def grasp_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
     )
     pre_touch_z = max(pre_touch_z, grasp_z_mm + 0.5)
     if pre_touch_z > grasp_z_mm + 0.2:
-        set_line(arm, x_mm, y_mm, pre_touch_z, yaw_use, ARM_SPEED_GRASP_DESCEND)
+        set_line(arm, x_mm, y_mm, pre_touch_z, yaw_use, ARM_SPEED_GRASP_CUBE_LEVEL)
         w = float(GRASP_WIGGLE_XY_MM)
         for dx, dy in ((w, 0.0), (-w, 0.0), (0.0, w), (0.0, -w), (0.0, 0.0)):
             set_line(arm, x_mm + dx, y_mm + dy, pre_touch_z, yaw_use, ARM_SPEED_GRASP_WIGGLE)
