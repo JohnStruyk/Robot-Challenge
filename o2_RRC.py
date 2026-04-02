@@ -1,6 +1,7 @@
 """
 o2_RRC — challenge 2 (minimal): AprilTag pose (checkpoint0), segment cubes, snap edge
-to 22.5 / 25 / 30 mm, stack at fixed tower XY.
+to 22.5 / 25 / 30 mm, stack at fixed tower XY. Cube orientation uses a **black border**
+hint (dark pixels on the top face) plus PCA / min-area rect fallbacks on bottom-layer points.
 
 **Route**: After the first good detection pass, cubes are sorted **largest → smallest**
 (nominal edge, then X). That order is fixed for the run. Each pick matches the **next**
@@ -81,9 +82,13 @@ TOTAL_CUBES = 9
 GPU_Z_MIN_M = 0.28
 GPU_Z_MAX_M = 1.4
 DENSE_CROP_MARGIN_M = 0.006
-BOTTOM_LAYER_FRAC = 0.20
-REFINE_AABB_ITERS = 10
-REFINE_AABB_ITERS_POST_VERTICAL = 5
+BOTTOM_LAYER_FRAC = 0.18
+REFINE_AABB_ITERS = 18
+REFINE_AABB_ITERS_POST_VERTICAL = 8
+
+# Black cube rim in the left camera image (BGR): use dark samples to pick top-face edge direction
+BLACK_BORDER_GRAY_MAX = 100
+BLACK_BORDER_MIN_POINTS = 14
 
 # Match live cube to planned step (meters)
 MATCH_MAX_DIST_M = 0.055
@@ -197,11 +202,120 @@ def _signed_height_point(c: numpy.ndarray, pm: numpy.ndarray) -> float:
     return float(c[0] * pm[0] + c[1] * pm[1] + c[2] * pm[2] + pm[3])
 
 
+def _bgr_gray_at_cam_points(
+    image_bgra: numpy.ndarray,
+    pts_cam: numpy.ndarray,
+    K: numpy.ndarray,
+) -> numpy.ndarray:
+    """Approx luminance (0–255) at ZED pixels for 3D points in the **camera** frame (meters)."""
+    h, w = image_bgra.shape[:2]
+    K = numpy.asarray(K, dtype=numpy.float64)
+    n = pts_cam.shape[0]
+    g = numpy.full(n, 255.0, dtype=numpy.float64)
+    z = numpy.maximum(pts_cam[:, 2], 1e-9)
+    u = numpy.round(K[0, 0] * pts_cam[:, 0] / z + K[0, 2]).astype(numpy.int32)
+    v = numpy.round(K[1, 1] * pts_cam[:, 1] / z + K[1, 2]).astype(numpy.int32)
+    m = (pts_cam[:, 2] > 1e-7) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    if numpy.any(m):
+        bgr = image_bgra[v[m], u[m], :3].astype(numpy.float64)
+        g[m] = 0.114 * bgr[:, 0] + 0.587 * bgr[:, 1] + 0.299 * bgr[:, 2]
+    return g
+
+
+def _x_axis_from_plane_uv(uv: numpy.ndarray) -> numpy.ndarray | None:
+    """Unit direction in plane (coefficients on e1,e2) from min-area rect of 2D points."""
+    if uv.shape[0] < 5:
+        return None
+    rect = cv2.minAreaRect(uv.astype(numpy.float32))
+    box = cv2.boxPoints(rect).astype(numpy.float64)
+    e01 = box[1] - box[0]
+    e12 = box[2] - box[1]
+    n1 = float(numpy.linalg.norm(e01))
+    n2 = float(numpy.linalg.norm(e12))
+    if n1 < 1e-9 and n2 < 1e-9:
+        return None
+    if n1 >= n2:
+        du, dv = e01[0] / n1, e01[1] / n1
+    else:
+        du, dv = e12[0] / n2, e12[1] / n2
+    d = numpy.array([du, dv], dtype=numpy.float64)
+    d /= numpy.linalg.norm(d) + 1e-12
+    return d
+
+
+def _x_axis_from_bottom_pca(u: numpy.ndarray, v: numpy.ndarray) -> numpy.ndarray | None:
+    """Major axis of bottom-layer footprint in plane coordinates (u·e1, u·e2)."""
+    n = u.size
+    if n < 8:
+        return None
+    uv = numpy.stack([u, v], axis=1).astype(numpy.float64)
+    uv -= numpy.mean(uv, axis=0, keepdims=True)
+    c = (uv.T @ uv) / max(1, n - 1)
+    _, vecs = numpy.linalg.eigh(c)
+    major = vecs[:, -1]
+    major /= numpy.linalg.norm(major) + 1e-12
+    return major
+
+
+def _choose_x_axis_bottom_face(
+    pts_cam: numpy.ndarray,
+    bottom_mask: numpy.ndarray,
+    p_plane_all: numpy.ndarray,
+    e1: numpy.ndarray,
+    e2: numpy.ndarray,
+    n: numpy.ndarray,
+    image_bgra: numpy.ndarray | None,
+    K: numpy.ndarray | None,
+) -> numpy.ndarray:
+    """
+    In-plane x axis (3D, unit, orthogonal to n). Prefers **black border** samples
+    in the image; else PCA on full bottom layer; else min-area rect on full bottom UV.
+    """
+    pref = numpy.median(p_plane_all[bottom_mask], axis=0)
+    rel_bot = p_plane_all[bottom_mask] - pref[None, :]
+    u = numpy.dot(rel_bot, e1)
+    v = numpy.dot(rel_bot, e2)
+    uv_bot = numpy.stack([u, v], axis=1)
+
+    du, dv = 1.0, 0.0
+    got = False
+
+    if image_bgra is not None and K is not None:
+        gray = _bgr_gray_at_cam_points(image_bgra, pts_cam, K)
+        dark = bottom_mask & (gray <= float(BLACK_BORDER_GRAY_MAX))
+        if int(numpy.sum(dark)) >= BLACK_BORDER_MIN_POINTS:
+            rel_d = p_plane_all[dark] - numpy.median(p_plane_all[dark], axis=0)[None, :]
+            ud = numpy.dot(rel_d, e1)
+            vd = numpy.dot(rel_d, e2)
+            uvd = numpy.stack([ud, vd], axis=1)
+            xd = _x_axis_from_plane_uv(uvd)
+            if xd is not None:
+                du, dv = float(xd[0]), float(xd[1])
+                got = True
+
+    if not got:
+        x2 = _x_axis_from_bottom_pca(u, v)
+        if x2 is not None:
+            du, dv = float(x2[0]), float(x2[1])
+            got = True
+    if not got:
+        xf = _x_axis_from_plane_uv(uv_bot)
+        if xf is not None:
+            du, dv = float(xf[0]), float(xf[1])
+
+    x_axis = du * e1 + dv * e2
+    x_axis = x_axis - numpy.dot(x_axis, n) * n
+    x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
+    return x_axis
+
+
 def precise_cube_pose_nominal(
     pts: numpy.ndarray,
     plane_model: numpy.ndarray,
     camera_pose: numpy.ndarray,
     edge_m: float,
+    image_bgra: numpy.ndarray | None = None,
+    K: numpy.ndarray | None = None,
 ) -> tuple[numpy.ndarray, numpy.ndarray] | None:
     if pts.shape[0] < 35:
         return None
@@ -228,25 +342,9 @@ def precise_cube_pose_nominal(
     c_bottom = numpy.median(p_bot, axis=0)
     center = c_bottom + (edge_m * 0.5) * n
 
-    rel = p_plane_all - numpy.median(p_plane_all, axis=0)[None, :]
-    u = numpy.dot(rel, e1)
-    v = numpy.dot(rel, e2)
-    uv = numpy.stack([u, v], axis=1).astype(numpy.float32)
-    if uv.shape[0] >= 5:
-        rect = cv2.minAreaRect(uv)
-        box = cv2.boxPoints(rect).astype(numpy.float64)
-        e01 = box[1] - box[0]
-        norm_e = float(numpy.linalg.norm(e01))
-        if norm_e > 1e-9:
-            du, dv = e01[0] / norm_e, e01[1] / norm_e
-            x_axis = du * e1 + dv * e2
-        else:
-            x_axis = e1
-    else:
-        x_axis = e1
-
-    x_axis = x_axis - numpy.dot(x_axis, n) * n
-    x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
+    x_axis = _choose_x_axis_bottom_face(
+        pts, bottom_mask, p_plane_all, e1, e2, n, image_bgra, K
+    )
     y_axis = numpy.cross(n, x_axis)
     y_axis = y_axis / (numpy.linalg.norm(y_axis) + 1e-12)
     R = orthonormalize_rotation(numpy.column_stack([x_axis, y_axis, n]))
@@ -282,10 +380,17 @@ def dedupe_detections(dets: list[dict]) -> list[dict]:
     return kept
 
 
-def detect_cubes_once(observation, camera_pose, max_cubes: int = MAX_CLUSTERS) -> list[dict]:
+def detect_cubes_once(
+    observation,
+    camera_pose,
+    camera_intrinsic: numpy.ndarray | None = None,
+    max_cubes: int = MAX_CLUSTERS,
+) -> list[dict]:
     image, point_cloud = observation
     if image is None or point_cloud is None:
         return []
+
+    K = numpy.asarray(camera_intrinsic, dtype=numpy.float64) if camera_intrinsic is not None else None
 
     full_pts_m = points_to_scene_meters(point_cloud)
     if full_pts_m.shape[0] < 120:
@@ -306,7 +411,14 @@ def detect_cubes_once(observation, camera_pose, max_cubes: int = MAX_CLUSTERS) -
         if pts.shape[0] < 30:
             continue
         edge_m = classify_nominal_edge(pts, plane_np, camera_pose)
-        pose_pair = precise_cube_pose_nominal(pts, plane_np, camera_pose, edge_m)
+        pose_pair = precise_cube_pose_nominal(
+            pts,
+            plane_np,
+            camera_pose,
+            edge_m,
+            image_bgra=image,
+            K=K,
+        )
         if pose_pair is None:
             continue
         t_robot, t_cam = pose_pair
@@ -465,7 +577,7 @@ def run_challenge_o2(
         if T is None:
             print("AprilTag calibration failed.")
             return 0
-        d0 = detect_cubes_once((img, zed.point_cloud), T)
+        d0 = detect_cubes_once((img, zed.point_cloud), T, camera_intrinsic)
         if len(d0) < 1:
             print("No cubes detected.")
             return 0
@@ -498,7 +610,7 @@ def run_challenge_o2(
             print("Calibration failed.")
             break
 
-        dets = detect_cubes_once((zed.image, zed.point_cloud), T)
+        dets = detect_cubes_once((zed.image, zed.point_cloud), T, camera_intrinsic)
         if route is None:
             route = preplan_route(dets)
             if not route:
