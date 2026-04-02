@@ -22,12 +22,16 @@ PLACE_Z_OFFSET = 0.002
 
 # Cartesian speed (mm/s) — higher = less time between waypoints (still waits for motion to finish).
 ARM_SPEED_TRAVEL_MM_S = 3200
-ARM_SPEED_PLACE_DESCEND_MM_S = 900
+# Slower final descend gives the gripper time to align before closing.
+ARM_SPEED_PLACE_DESCEND_MM_S = 550
 
-# Gripper settle (seconds) — shorter than legacy 1.0s; increase if grasp is unreliable.
-GRIPPER_SETTLE_AFTER_OPEN_S = 0.18
-GRIPPER_SETTLE_AFTER_CLOSE_S = 0.20
-GRIPPER_SETTLE_AFTER_RELEASE_S = 0.24
+# Gripper settle (seconds) — longer waits help unreliable grasps (open/close/release).
+GRIPPER_SETTLE_AFTER_OPEN_S = 0.40
+GRIPPER_SETTLE_AFTER_CLOSE_S = 0.55
+GRIPPER_SETTLE_AFTER_RELEASE_S = 0.40
+
+# Pause at grasp height (jaws still open) before closing — helps seating on small cubes.
+GRASP_DWELL_BEFORE_CLOSE_S = 0.25
 
 # Keep tool mostly vertical; only yaw is adapted from cube pose.
 TOOL_ROLL_DEG = 180.0
@@ -68,6 +72,7 @@ def grasp_cube(arm, cube_pose):
         x_mm, y_mm, grasp_z_mm, TOOL_ROLL_DEG, TOOL_PITCH_DEG, cube_yaw_deg,
         speed=ARM_SPEED_PLACE_DESCEND_MM_S, is_radian=False, wait=True,
     )
+    time.sleep(GRASP_DWELL_BEFORE_CLOSE_S)
     arm.close_lite6_gripper()
     time.sleep(GRIPPER_SETTLE_AFTER_CLOSE_S)
     arm.set_position(
