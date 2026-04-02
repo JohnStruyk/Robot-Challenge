@@ -8,6 +8,7 @@ from utils.zed_camera import ZedCamera
 from checkpoint0 import TAG_CENTER_COORDINATES, get_transform_camera_robot
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 from best_RRC1 import grasp_cube_fast, place_cube_fast
+from orientation_RRC import physical_cube_pose_from_points
 
 CUBE_SIZE = 0.025
 STACK_HEIGHT_GOAL = 9
@@ -33,6 +34,11 @@ MID_CUBE_SIZE = 0.025
 MID_CUBES_GOAL = 3
 BIG_CUBE_SIZE = 0.03
 BIG_CUBES_GOAL = 3
+
+# Largest three blobs: richer cloud + table-plane pose (30 mm nominal).
+LARGE_DENSE_CROP_MARGIN_M = 0.012
+# Prefer refined pose when OBB suggests ~30 mm class (avoids mis-applying 30 mm model to 25 mm).
+LARGE_EXTENT_MIN_M = 0.0265
 
 
 def filter_points_playmat_cam_frame(pts_m: numpy.ndarray, T_cam_robot: numpy.ndarray) -> numpy.ndarray:
@@ -79,35 +85,38 @@ def points_to_meters_open3d(xyz):
 
 def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
     """
-    Segment a tabletop cube: voxel downsample, outliers, RANSAC plane, DBSCAN,
-    then pick the most cube-like cluster (with a size fallback).
+    Segment tabletop cubes: voxel, outliers, RANSAC table plane, DBSCAN, score.
+
+    Returns ``(clusters, message, plane_np)`` where ``plane_np`` is the first table
+    plane (4-vector) for physical cube pose on the largest cubes.
     """
     if len(pcd.points) < 150:
-        return None, "too few points after NaN filter"
+        return None, "too few points after NaN filter", None
 
     pcd = pcd.voxel_down_sample(voxel_size=0.003)
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=25, std_ratio=2.0)
 
     if len(pcd.points) < 100:
-        return None, "too few points after voxel/outlier"
+        return None, "too few points after voxel/outlier", None
 
     plane_model, inliers = pcd.segment_plane(
         distance_threshold=0.010,
         ransac_n=3,
         num_iterations=1500,
     )
+    plane_np = numpy.asarray(plane_model, dtype=numpy.float64).copy()
     if len(inliers) > 0 and len(inliers) > 0.12 * len(pcd.points):
         pcd = pcd.select_by_index(inliers, invert=True)
 
     if len(pcd.points) < 80:
-        return None, "nothing left after plane removal"
+        return None, "nothing left after plane removal", plane_np
 
     labels = numpy.asarray(
         pcd.cluster_dbscan(eps=0.020, min_points=25, print_progress=False)
     )
     max_label = int(labels.max()) if labels.size else -1
     if max_label < 0:
-        return None, "DBSCAN found no clusters"
+        return None, "DBSCAN found no clusters", plane_np
 
     def score_cluster(cluster, idx):
         obb = cluster.get_oriented_bounding_box()
@@ -134,28 +143,43 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
         cluster = pcd.select_by_index(idx)
         sc, chosen = score_cluster(cluster, idx)
 
-        # keep track of all clusters for fallback
         fallback_clusters.append((idx.size, cluster))
 
         if chosen is not None:
             scored_clusters.append((sc, chosen))
 
-    # sort by score descending
     scored_clusters.sort(key=lambda x: x[0], reverse=True)
 
     if len(scored_clusters) > 0:
         top_clusters = [c for (_, c) in scored_clusters[:num_cubes]]
-        return top_clusters, f"{len(top_clusters)} cube-like clusters"
+        return top_clusters, f"{len(top_clusters)} cube-like clusters", plane_np
 
-    # fallback: largest clusters by size
     fallback_clusters.sort(key=lambda x: x[0], reverse=True)
 
     if len(fallback_clusters) > 0:
         top_clusters = [c for (_, c) in fallback_clusters[:num_cubes] if len(c.points) >= 40]
         if len(top_clusters) > 0:
-            return top_clusters, f"fallback: {len(top_clusters)} largest clusters"
+            return top_clusters, f"fallback: {len(top_clusters)} largest clusters", plane_np
 
-    return None, "no cluster passed filters"
+    return None, "no cluster passed filters", plane_np
+
+
+def extract_dense_cluster_points(
+    full_pts_m: numpy.ndarray,
+    cluster: o3d.geometry.PointCloud,
+    margin_m: float,
+) -> numpy.ndarray:
+    """Re-crop full-resolution cloud around cluster OBB (more points for 30 mm pose)."""
+    pts = numpy.asarray(cluster.points, dtype=numpy.float64)
+    if pts.shape[0] == 0:
+        return pts
+    lo = numpy.min(pts, axis=0) - margin_m
+    hi = numpy.max(pts, axis=0) + margin_m
+    m = numpy.all((full_pts_m >= lo) & (full_pts_m <= hi), axis=1)
+    dense = full_pts_m[m]
+    if dense.shape[0] < 45:
+        return pts
+    return dense
 
 def get_cube_transform(cube_pcd, camera_pose):
     if cube_pcd is None or len(cube_pcd.points) < 30:
@@ -202,6 +226,34 @@ def get_cube_transform(cube_pcd, camera_pose):
     return (t_robot_cube, t_cam_cube)
 
 
+def pose_large_cube_physical(
+    cluster: o3d.geometry.PointCloud,
+    full_pts_m: numpy.ndarray,
+    plane_model: numpy.ndarray,
+    camera_pose: numpy.ndarray,
+) -> tuple[numpy.ndarray, numpy.ndarray] | None:
+    """
+    Bottom-face footprint + min-area yaw + bound centering at 30 mm — better XY/Z than OBB
+    for the biggest cubes when the table plane is trustworthy.
+    """
+    pts = extract_dense_cluster_points(
+        full_pts_m, cluster, margin_m=LARGE_DENSE_CROP_MARGIN_M
+    )
+    if pts.shape[0] < 35:
+        pts = numpy.asarray(cluster.points, dtype=numpy.float64)
+    if pts.shape[0] < 30:
+        return None
+    return physical_cube_pose_from_points(
+        pts,
+        plane_model,
+        camera_pose,
+        BIG_CUBE_SIZE,
+        bottom_layer_frac=0.11,
+        bound_center_iters=5,
+        yaw_source="blend",
+    )
+
+
 def get_cube_transforms(observation, camera_intrinsic, camera_pose):
     """
     Estimate cube pose from image + point cloud (geometry; image for API only).
@@ -236,11 +288,11 @@ def get_cube_transforms(observation, camera_intrinsic, camera_pose):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(valid_points_m)
 
-    cube_pcds, status = isolate_cube_cluster_open3d(pcd, num_cubes=STACK_HEIGHT_GOAL)
+    cube_pcds, status, plane_np = isolate_cube_cluster_open3d(pcd, num_cubes=STACK_HEIGHT_GOAL)
     if cube_pcds is None:
         return None, status or "clustering failed"
 
-    transforms = []
+    candidates: list[tuple[float, tuple[numpy.ndarray, numpy.ndarray]]] = []
 
     for cp in cube_pcds:
         obb = cp.get_oriented_bounding_box()
@@ -248,19 +300,50 @@ def get_cube_transforms(observation, camera_intrinsic, camera_pose):
         size = float(numpy.max(extent))
 
         t = get_cube_transform(cp, camera_pose)
-
         if t is None:
             continue
         t_robot, _t_cam = t
         if not is_center_on_playmat_robot(numpy.asarray(t_robot[:3, 3], dtype=numpy.float64)):
             continue
-        transforms.append((size, t))
+        candidates.append((size, t))
 
-    transforms.sort(key=lambda x: x[0], reverse=True)
-    transforms = transforms[:STACK_HEIGHT_GOAL]
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    candidates = candidates[:STACK_HEIGHT_GOAL]
 
-    out = [t for (_, t) in transforms]
-    return out, f"{len(out)} cube(s) on play mat (cap {STACK_HEIGHT_GOAL})"
+    out: list[tuple[numpy.ndarray, numpy.ndarray]] = []
+    n_refined = 0
+    for rank, (_size, t_obb) in enumerate(candidates):
+        # Match sparse cluster by camera-frame center (clusters are in camera frame).
+        obb_c = numpy.asarray(t_obb[1][:3, 3], dtype=numpy.float64)
+        best_cp = None
+        best_d = 1e9
+        for c in cube_pcds:
+            c_ctr = numpy.asarray(c.get_oriented_bounding_box().center, dtype=numpy.float64)
+            d = float(numpy.linalg.norm(c_ctr - obb_c))
+            if d < best_d:
+                best_d, best_cp = d, c
+        cp = best_cp
+
+        use_refined = (
+            rank < BIG_CUBES_GOAL
+            and plane_np is not None
+            and cp is not None
+            and float(_size) >= LARGE_EXTENT_MIN_M
+        )
+        t_final = t_obb
+        if use_refined:
+            phys = pose_large_cube_physical(cp, valid_points_m, plane_np, camera_pose)
+            if phys is not None:
+                t_robot_p, _t_cam_p = phys
+                if is_center_on_playmat_robot(
+                    numpy.asarray(t_robot_p[:3, 3], dtype=numpy.float64)
+                ):
+                    t_final = phys
+                    n_refined += 1
+        out.append(t_final)
+
+    msg = f"{len(out)} cube(s) on play mat; {n_refined} large pose(s) refined (30 mm physical)"
+    return out, msg
 
 
 def draw_status_overlay(image_bgra, lines, color=(0, 220, 0)):
