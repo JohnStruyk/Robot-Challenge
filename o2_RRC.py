@@ -14,8 +14,10 @@ frame — the axis-aligned rectangle spanned by the **four** AprilTag centers in
 uses this full rectangle so nothing off-mat is clustered). Small XY margin inset
 avoids the tag markers themselves.
 
-**Route**: Largest → smallest (nominal edge, then X); each step matches the planned
-center. **Grasp**: yaw snapped to 90°.
+**Route**: Largest → smallest (nominal edge, then X). Each step matches **nominal**
+edge (22.5 / 25 / 30 mm) then nearest XY — not raw float tolerance. Orientation is
+snapped to **AprilTag world** axes (+Z up, X/Y along mat cardinals). **Grasp**: yaw
+snapped to 90° on top of that.
 """
 from __future__ import annotations
 
@@ -44,6 +46,7 @@ from orientation_RRC import (
     CUBE_SIZE_MEDIUM_M,
     CUBE_SIZE_SMALL_M,
     isolate_cube_cluster_open3d,
+    orthonormalize_rotation,
     physical_cube_pose_from_points,
     points_to_meters_open3d,
     _in_plane_basis,
@@ -128,14 +131,14 @@ POSE_PARAMS_MEDIUM = CubePoseParams(
     refine_snap_cycles=1,
     yaw_source="bottom",
 )
-# 30 mm: thin contact slice, many iterations, percentile contact height, yaw from bottom face.
+# 30 mm: thin contact slice; blend bottom+full yaw (large blue often has noisy bottom band).
 POSE_PARAMS_LARGE = CubePoseParams(
-    bottom_layer_frac=0.14,
-    bound_center_iters=6,
-    extra_bound_iters=8,
-    h_contact_percentile=4.0,
+    bottom_layer_frac=0.12,
+    bound_center_iters=7,
+    extra_bound_iters=9,
+    h_contact_percentile=3.5,
     refine_snap_cycles=2,
-    yaw_source="bottom",
+    yaw_source="blend",
 )
 
 
@@ -170,9 +173,10 @@ PLAY_AREA_Y_MAX_M = float(_TAG_CENTERS_XY[:, 1].max() - PLAY_AREA_XY_MARGIN_M)
 # Vertical band (robot Z): table surface + cubes; independent of tag XY layout.
 WORKSPACE_Z_ROBOT_M = (-0.12, 0.48)
 
-# Match live cube to planned step (meters)
+# Match live cube to planned step (meters). Compare **nominal** edges via ``snap_edge_to_nominal``.
 MATCH_MAX_DIST_M = 0.055
-MATCH_EDGE_TOL_M = 0.002
+# Soft fallback when no exact nominal match (raw edge tolerance, meters).
+MATCH_EDGE_SOFT_TOL_M = 0.008
 
 
 def snap_edge_to_nominal(edge_m: float) -> float:
@@ -290,9 +294,15 @@ def classify_nominal_edge(
     plane_model: numpy.ndarray,
     camera_pose: numpy.ndarray,
 ) -> float:
+    """
+    Nominal edge (22.5 / 25 / 30 mm). **Primary** cue: vertical span along the table
+    normal in **tag/world meters** (PnP-scaled) — that matches physical cube height.
+    Secondary: OBB + footprint (legacy) when ambiguous.
+    """
     pm = flip_plane_to_robot_up(plane_model, camera_pose)
     h = _signed_plane_dist(pts, pm)
     span_v = float(numpy.max(h) - numpy.min(h))
+
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts.astype(numpy.float64))
     obb = pcd.get_oriented_bounding_box()
@@ -317,7 +327,59 @@ def classify_nominal_edge(
 
     pooled = float(numpy.median(numpy.array([span_v, med_edge, foot], dtype=numpy.float64)))
     pooled = float(numpy.clip(pooled, EDGE_MIN_M, EDGE_MAX_M))
-    return snap_edge_to_nominal(pooled)
+
+    edge_from_height = snap_edge_to_nominal(span_v)
+    edge_from_pool = snap_edge_to_nominal(pooled)
+
+    # Height span is the most direct metric for stock size in world units.
+    if edge_from_height != edge_from_pool:
+        err_h = abs(span_v - float(edge_from_height))
+        err_p = abs(span_v - float(edge_from_pool))
+        if err_h + 1e-9 < err_p:
+            return float(edge_from_height)
+        if err_p + 1e-9 < err_h:
+            return float(edge_from_pool)
+        # Tie-break: favour height for large physical cubes (common mislabel: blue 30 mm → 25 mm).
+        if span_v >= 0.0275:
+            return float(CUBE_SIZE_LARGE_M)
+        if span_v <= 0.0235:
+            return float(edge_from_height)
+        return float(edge_from_pool)
+
+    return float(edge_from_height)
+
+
+def snap_cube_pose_to_tag_world_axes(t_robot: numpy.ndarray) -> numpy.ndarray:
+    """
+    AprilTag / robot world: +Z is up; play mat lies in XY. Snap cube frame so **Z** is
+    world up and **X** is the nearest axis to ±X or ±Y (mat edges), fixing drift from
+    min-area rect on noisy clouds.
+    """
+    R = t_robot[:3, :3].copy()
+    z_w = numpy.array([0.0, 0.0, 1.0], dtype=numpy.float64)
+    xc = R[:, 0]
+    x_proj = xc - numpy.dot(xc, z_w) * z_w
+    nrm = numpy.linalg.norm(x_proj)
+    if nrm < 1e-9:
+        x_proj = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float64)
+    else:
+        x_proj = x_proj / nrm
+    cardinals = (
+        numpy.array([1.0, 0.0, 0.0], dtype=numpy.float64),
+        numpy.array([-1.0, 0.0, 0.0], dtype=numpy.float64),
+        numpy.array([0.0, 1.0, 0.0], dtype=numpy.float64),
+        numpy.array([0.0, -1.0, 0.0], dtype=numpy.float64),
+    )
+    dots = [float(numpy.dot(x_proj, c)) for c in cardinals]
+    x_w = cardinals[int(numpy.argmax(dots))]
+    y_w = numpy.cross(z_w, x_w)
+    y_w = y_w / (numpy.linalg.norm(y_w) + 1e-12)
+    x_w = numpy.cross(y_w, z_w)
+    x_w = x_w / (numpy.linalg.norm(x_w) + 1e-12)
+    R_new = orthonormalize_rotation(numpy.column_stack([x_w, y_w, z_w]))
+    out = numpy.copy(t_robot)
+    out[:3, :3] = R_new
+    return out
 
 
 def refine_cube_pose_bound_center_cam(
@@ -407,6 +469,8 @@ def compute_cube_pose_o2(
         t_cam[:3, 3] = c
     T_cam_robot = numpy.asarray(camera_pose, dtype=numpy.float64)
     t_robot = numpy.linalg.inv(T_cam_robot) @ t_cam
+    t_robot = snap_cube_pose_to_tag_world_axes(t_robot)
+    t_cam = T_cam_robot @ t_robot
     return t_robot, t_cam
 
 
@@ -494,14 +558,16 @@ def match_step_to_detection(
     planned_center: numpy.ndarray,
     planned_edge: float,
 ) -> dict | None:
-    """Nearest current cube to this plan step; edge must be roughly consistent."""
+    """Nearest cube whose **nominal** edge matches the planned step (not raw float ±tol)."""
+    pe = snap_edge_to_nominal(float(planned_edge))
     best: dict | None = None
     best_d = 1e9
+    pc = numpy.asarray(planned_center, dtype=numpy.float64).reshape(3)
     for d in dets:
-        if abs(float(d["edge_m"]) - float(planned_edge)) > MATCH_EDGE_TOL_M:
+        if snap_edge_to_nominal(float(d["edge_m"])) != pe:
             continue
         p = numpy.asarray(d["t_robot"][:3, 3], dtype=numpy.float64)
-        dist = float(numpy.linalg.norm(p - planned_center))
+        dist = float(numpy.linalg.norm(p - pc))
         if dist < best_d:
             best_d = dist
             best = d
@@ -510,6 +576,40 @@ def match_step_to_detection(
     if best_d > MATCH_MAX_DIST_M:
         return None
     return best
+
+
+def fallback_pick_for_step(
+    dets: list[dict],
+    planned_center: numpy.ndarray,
+    planned_edge: float,
+) -> dict | None:
+    """
+    If strict nominal match failed: prefer same nominal edge anyway (nearest XY),
+    then soft raw-edge tolerance — never “just take largest edge” (wrong colour/size).
+    """
+    if not dets:
+        return None
+    pe = snap_edge_to_nominal(float(planned_edge))
+    pc = numpy.asarray(planned_center, dtype=numpy.float64).reshape(3)
+
+    same_nominal = [d for d in dets if snap_edge_to_nominal(float(d["edge_m"])) == pe]
+    if same_nominal:
+        return min(
+            same_nominal,
+            key=lambda d: float(numpy.linalg.norm(numpy.asarray(d["t_robot"][:3, 3]) - pc)),
+        )
+
+    soft = [
+        d
+        for d in dets
+        if abs(float(d["edge_m"]) - float(planned_edge)) < MATCH_EDGE_SOFT_TOL_M
+    ]
+    if soft:
+        return min(
+            soft,
+            key=lambda d: float(numpy.linalg.norm(numpy.asarray(d["t_robot"][:3, 3]) - pc)),
+        )
+    return None
 
 
 def compute_safe_clearance_z_mm(tower_top_z_m, cube_center_z_m, cube_height_m):
@@ -675,8 +775,12 @@ def run_challenge_o2(
         pc, pe = route[placed]
         pick = match_step_to_detection(dets, pc, pe)
         if pick is None:
-            pick = sorted(dets, key=lambda d: -float(d["edge_m"]))[0]
-            print(f"Step {placed + 1}: loose match; taking largest visible cube.")
+            pick = fallback_pick_for_step(dets, pc, pe)
+            if pick is not None:
+                print(f"Step {placed + 1}: using soft edge / nearest-XY fallback to planned nominal.")
+        if pick is None:
+            print(f"Step {placed + 1}: no detection matches planned edge {pe:.4f} m — stopping.")
+            break
 
         h_m = float(pick["edge_m"])
         t_src = pick["t_robot"]
