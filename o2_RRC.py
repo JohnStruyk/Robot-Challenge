@@ -11,7 +11,7 @@ measured cloud — this refines **position + orientation** for the actual camera
 and play-mat geometry without hand-tuned cardinal snaps.
 
 **Route**: Largest → smallest; match by **nominal** edge + nearest XY. **Grasp**: yaw
-snapped to 90°.
+snapped to 90°, slower final descent, small XY + yaw wiggle at pre-touch to seat the gripper.
 """
 from __future__ import annotations
 
@@ -68,7 +68,13 @@ ARM_SPEED_TRAVEL = 1200
 ARM_SPEED_APPROACH = 320
 ARM_SPEED_PLACE_FINAL = 70
 ARM_SPEED_LIFT = 1000
-ARM_SPEED_GRASP_DESCEND = 250
+# Grasp: slower overall descent + very slow final mm + compliance wiggle at pre-touch.
+ARM_SPEED_GRASP_DESCEND = 160
+ARM_SPEED_GRASP_DESCEND_FINAL = 65
+ARM_SPEED_GRASP_WIGGLE = 50
+GRASP_FINAL_APPROACH_MM = 5.0
+GRASP_WIGGLE_XY_MM = 0.9
+GRASP_WIGGLE_YAW_DEG = 1.0
 GRIPPER_SETTLE_GRASP_S = 0.25
 GRIPPER_SETTLE_PLACE_S = 0.45
 RELEASE_WAIT_S = 0.45
@@ -654,7 +660,25 @@ def grasp_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
     arm.open_lite6_gripper()
     time.sleep(GRIPPER_SETTLE_GRASP_S)
     set_line(arm, x_mm, y_mm, safe_z_mm, yaw_use, ARM_SPEED_TRAVEL)
-    set_line(arm, x_mm, y_mm, grasp_z_mm, yaw_use, ARM_SPEED_GRASP_DESCEND)
+    # Pre-touch height: stay below safe clearance; at least ~0.5 mm above grasp for wiggle + final plunge.
+    pre_touch_z = min(
+        grasp_z_mm + float(GRASP_FINAL_APPROACH_MM),
+        float(safe_z_mm) - 1.0,
+    )
+    pre_touch_z = max(pre_touch_z, grasp_z_mm + 0.5)
+    if pre_touch_z > grasp_z_mm + 0.2:
+        set_line(arm, x_mm, y_mm, pre_touch_z, yaw_use, ARM_SPEED_GRASP_DESCEND)
+        w = float(GRASP_WIGGLE_XY_MM)
+        for dx, dy in ((w, 0.0), (-w, 0.0), (0.0, w), (0.0, -w), (0.0, 0.0)):
+            set_line(arm, x_mm + dx, y_mm + dy, pre_touch_z, yaw_use, ARM_SPEED_GRASP_WIGGLE)
+        yw = float(GRASP_WIGGLE_YAW_DEG)
+        if yw > 0.05:
+            set_line(arm, x_mm, y_mm, pre_touch_z, yaw_use + yw, ARM_SPEED_GRASP_WIGGLE)
+            set_line(arm, x_mm, y_mm, pre_touch_z, yaw_use - yw, ARM_SPEED_GRASP_WIGGLE)
+            set_line(arm, x_mm, y_mm, pre_touch_z, yaw_use, ARM_SPEED_GRASP_WIGGLE)
+        set_line(arm, x_mm, y_mm, grasp_z_mm, yaw_use, ARM_SPEED_GRASP_DESCEND_FINAL)
+    else:
+        set_line(arm, x_mm, y_mm, grasp_z_mm, yaw_use, ARM_SPEED_GRASP_DESCEND_FINAL)
     arm.close_lite6_gripper()
     time.sleep(GRIPPER_SETTLE_GRASP_S)
     set_line(arm, x_mm, y_mm, lift_z_mm, yaw_use, ARM_SPEED_LIFT)
