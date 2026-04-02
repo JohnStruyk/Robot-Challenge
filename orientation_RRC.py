@@ -82,8 +82,8 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
     if len(pcd.points) < 150:
         return None, "too few points after NaN filter", None
 
-    pcd = pcd.voxel_down_sample(voxel_size=0.003)
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=25, std_ratio=2.0)
+    pcd = pcd.voxel_down_sample(voxel_size=0.004)
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=18, std_ratio=2.0)
 
     if len(pcd.points) < 100:
         return None, "too few points after voxel/outlier", None
@@ -91,7 +91,7 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
     plane_model, inliers = pcd.segment_plane(
         distance_threshold=0.010,
         ransac_n=3,
-        num_iterations=1500,
+        num_iterations=450,
     )
     plane_np = numpy.asarray(plane_model, dtype=numpy.float64).copy()
     if len(inliers) > 0 and len(inliers) > 0.12 * len(pcd.points):
@@ -101,7 +101,7 @@ def isolate_cube_cluster_open3d(pcd: o3d.geometry.PointCloud, num_cubes):
         return None, "nothing left after plane removal", plane_np
 
     labels = numpy.asarray(
-        pcd.cluster_dbscan(eps=0.020, min_points=25, print_progress=False)
+        pcd.cluster_dbscan(eps=0.022, min_points=20, print_progress=False)
     )
     max_label = int(labels.max()) if labels.size else -1
     if max_label < 0:

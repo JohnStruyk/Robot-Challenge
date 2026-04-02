@@ -114,30 +114,29 @@ MEDIUM_DENSE_CROP_MARGIN_M = 0.008
 LARGE_DENSE_CROP_MARGIN_M = 0.012
 LARGE_CLUSTER_MIN_EXTENT_M = 0.027
 
-# Open3D ICP: synthetic cube mesh → measured cluster (camera frame, meters).
-ICP_MESH_SAMPLES = 1500
-ICP_VOXEL_M = 0.0025
-ICP_MAX_CORR_COARSE_M = 0.020
-ICP_MAX_CORR_FINE_M = 0.007
-ICP_COARSE_ITERS = 32
-ICP_FINE_ITERS = 26
-ICP_MIN_FITNESS = 0.12
-# Fewer yaw hypotheses = faster; increase to 4 if ICP picks wrong 90° often.
-ICP_YAW_HYPOTHESIS_COUNT = 2
+# Open3D ICP — trimmed for speed; footprint blend + geometry init still anchor XY/Z.
+ICP_MESH_SAMPLES = 800
+ICP_VOXEL_M = 0.0032
+ICP_MAX_CORR_COARSE_M = 0.022
+ICP_MAX_CORR_FINE_M = 0.008
+ICP_COARSE_ITERS = 14
+ICP_FINE_ITERS = 8
+ICP_MIN_FITNESS = 0.10
+# Single ICP from geometry init; set 2–4 if yaw often wrong by 90°.
+ICP_YAW_HYPOTHESIS_COUNT = 1
 
-# Pre-ICP physical init: single pipeline; ICP does the fine alignment.
-PHYSICAL_INIT_BOUND_EXTRA = 2
+PHYSICAL_INIT_BOUND_EXTRA = 1
 PHYSICAL_INIT_YAW_SOURCE = "bottom"
-# Extra AABB centering in cube frame after ICP + footprint blend (large cubes need tight XY).
-BOUND_CENTER_ITERS_AFTER_ICP_SMALL = 2
-BOUND_CENTER_ITERS_AFTER_ICP_MEDIUM = 3
-BOUND_CENTER_ITERS_AFTER_ICP_LARGE = 5
+BOUND_CENTER_ITERS_AFTER_ICP_SMALL = 1
+BOUND_CENTER_ITERS_AFTER_ICP_MEDIUM = 1
+BOUND_CENTER_ITERS_AFTER_ICP_LARGE = 2
 
-# Per-cluster plane refit (bottom points only) — more stable normal than global table RANSAC.
 CLUSTER_PLANE_BOTTOM_FRAC = 0.38
 CLUSTER_PLANE_RANSAC_DIST_M = 0.0022
 CLUSTER_PLANE_MIN_INLIER_FRAC = 0.22
-CLUSTER_PLANE_RANSAC_ITERS = 180
+CLUSTER_PLANE_RANSAC_ITERS = 64
+# Skip per-frame preprocess (stats/blur); saves CPU each detection pass.
+ENABLE_SCENE_PREPROCESS = False
 
 
 def preprocess_scene_observation(
@@ -253,7 +252,7 @@ def rotation_from_vertical_side_faces(
     pcd.points = o3d.utility.Vector3dVector(pts_cam[idx].astype(numpy.float64))
     try:
         pcd.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.0075, max_nn=24)
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.009, max_nn=14)
         )
     except Exception:
         return None
@@ -490,9 +489,9 @@ def _icp_tuning_for_edge(edge_m: float) -> tuple[float, float, int, int]:
     """(voxel_m, max_corr_fine_m, coarse_iters, fine_iters) — tighter for 30 mm (gripper margin)."""
     b = _nominal_edge_bucket(edge_m)
     if b == "large":
-        return 0.0018, 0.0045, 38, 30
+        return 0.0024, 0.0085, 16, 9
     if b == "small":
-        return 0.0030, 0.0080, 28, 22
+        return 0.0034, 0.0095, 12, 7
     return ICP_VOXEL_M, ICP_MAX_CORR_FINE_M, ICP_COARSE_ITERS, ICP_FINE_ITERS
 
 
@@ -764,7 +763,7 @@ def _icp_single_with_metrics(
     voxel_m, corr_fine_m, coarse_iters, fine_iters = _icp_tuning_for_edge(edge_m)
     mesh = o3d.geometry.TriangleMesh.create_box(em, em, em)
     mesh.translate(-numpy.array([em * 0.5, em * 0.5, em * 0.5], dtype=numpy.float64))
-    n_src = min(ICP_MESH_SAMPLES, max(400, int(pts_cam.shape[0] * 18)))
+    n_src = min(ICP_MESH_SAMPLES, max(280, int(pts_cam.shape[0] * 10)))
     source = mesh.sample_points_uniformly(number_of_points=n_src)
     target = o3d.geometry.PointCloud()
     target.points = o3d.utility.Vector3dVector(pts_cam.astype(numpy.float64))
@@ -773,7 +772,7 @@ def _icp_single_with_metrics(
         target_ds = target
     try:
         target_ds.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.012, max_nn=30)
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.014, max_nn=18)
         )
     except Exception:
         return T0, 0.0, 1e9
@@ -797,7 +796,7 @@ def _icp_single_with_metrics(
             return T0, fit1, 1e9
         try:
             target_ds.estimate_normals(
-                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.008, max_nn=25)
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.010, max_nn=16)
             )
         except Exception:
             T = T1
@@ -992,7 +991,8 @@ def detect_cubes_once(
     if full_pts_m.shape[0] < 120:
         return []
 
-    _ = preprocess_scene_observation(image, full_pts_m, camera_intrinsic)
+    if ENABLE_SCENE_PREPROCESS:
+        _ = preprocess_scene_observation(image, full_pts_m, camera_intrinsic)
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(full_pts_m)
