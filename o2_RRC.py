@@ -1,17 +1,20 @@
 """
 o2_RRC — challenge 2 (minimal): AprilTag (checkpoint0), cluster cubes, nominal 22.5 / 25 / 30 mm.
 
-**Perception model**: AprilTag PnP gives **camera ↔ world** (tag frame) at real scale.
-Points are cropped to the **tag rectangle** on the play mat. Each cluster is a cube
-candidate: **size** from height span + OBB (``classify_nominal_edge``). **Pose** is
-**(1)** ``physical_cube_pose_from_points`` (table plane, bottom footprint, min-area yaw)
-as a **seed**, **(2)** one bound-center + height snap along the plane normal, **(3)**
-**Open3D ICP**: a **synthetic cube mesh** (exact ``edge_m``) is registered to the
-measured cloud — this refines **position + orientation** for the actual camera angle
-and play-mat geometry without hand-tuned cardinal snaps.
+**Inventory (9 cubes)**: three nominal sizes, three cubes each — large (30 mm, e.g. red/green/blue),
+medium (25 mm), small (22.5 mm). Route picks **all three large** (order by −X), then **three medium**,
+then **three small** (same tie-break).
 
-**Route**: Largest → smallest; match by **nominal** edge + nearest XY. **Grasp**: yaw
-snapped to 90°, speed ≥50 at cube level; pose uses size-aware footprint centroid for tight XY on large cubes.
+**Arm pose math** (must match ``orientation_RRC.physical_cube_pose_from_points``):
+``get_transform_camera_robot`` → ``T_cam_robot`` with **P_cam = T_cam_robot @ P_robot** (tag/world = robot
+frame). Cube pose ``T_cam_cube`` maps cube frame to camera. Then **T_robot_cube = inv(T_cam_robot) @ T_cam_cube**.
+
+**Perception**: Points cropped to the play mat; pose = physical init + ICP + footprint blend. Detections
+whose cube center **does not project into the current image** are rejected (avoids grasping to empty space
+when pose is inconsistent with the RGB view).
+
+**Route**: Sort by **nominal** edge (not raw float), then −X. Match steps by nominal edge + nearest XY.
+**Grasp**: yaw snapped to 90°; no wiggle.
 """
 from __future__ import annotations
 
@@ -71,10 +74,7 @@ ARM_SPEED_LIFT = 1000
 # Grasp: slow at cube level (~35 mm gripper vs 30 mm cubes → need precise XY; keep ≥50).
 ARM_SPEED_GRASP_CUBE_LEVEL = 50
 ARM_SPEED_GRASP_DESCEND_FINAL = 50
-ARM_SPEED_GRASP_WIGGLE = 50
 GRASP_FINAL_APPROACH_MM = 5.0
-GRASP_WIGGLE_XY_MM = 0.9
-GRASP_WIGGLE_YAW_DEG = 1.0
 GRIPPER_SETTLE_GRASP_S = 0.25
 GRIPPER_SETTLE_PLACE_S = 0.45
 RELEASE_WAIT_S = 0.45
@@ -89,6 +89,8 @@ REF_CUBE_HEIGHT_M = CUBE_SIZE_LARGE_M
 MAX_CLUSTERS = 9
 DEDUPE_MIN_SEP_M = 0.018
 TOTAL_CUBES = 9
+# Expected counts per nominal size (challenge layout: 3 large, 3 medium, 3 small).
+CUBES_PER_NOMINAL_SIZE = 3
 
 GPU_Z_MIN_M = 0.28
 GPU_Z_MAX_M = 1.4
@@ -251,13 +253,53 @@ PLAY_AREA_Y_MAX_M = float(_TAG_CENTERS_XY[:, 1].max() - PLAY_AREA_XY_MARGIN_M)
 WORKSPACE_Z_ROBOT_M = (-0.12, 0.48)
 
 # Match live cube to planned step (meters). Compare **nominal** edges via ``snap_edge_to_nominal``.
-MATCH_MAX_DIST_M = 0.055
+MATCH_MAX_DIST_M = 0.042
+# Soft fallback only if still within this XY distance (meters) from planned center.
+FALLBACK_MAX_DIST_M = 0.052
 # Soft fallback when no exact nominal match (raw edge tolerance, meters).
 MATCH_EDGE_SOFT_TOL_M = 0.008
+# Cube center must project into image with this margin (pixels) or detection is rejected.
+IMAGE_PROJECTION_MARGIN_PX = 12.0
 
 
 def snap_edge_to_nominal(edge_m: float) -> float:
     return min(CUBE_SIZES_M, key=lambda s: abs(float(s) - float(edge_m)))
+
+
+def cube_center_visible_in_image(
+    t_cam_cube: numpy.ndarray,
+    camera_intrinsic: numpy.ndarray,
+    image_shape_hw,
+    *,
+    margin_px: float = IMAGE_PROJECTION_MARGIN_PX,
+) -> bool:
+    """
+    Cube origin in camera frame must lie in front of the camera and project inside the
+    image (OpenCV camera: +Z forward, X right, Y down). Rejects bogus poses that would
+    drive the arm to empty space while nothing appears at that pixel.
+    """
+    K = numpy.asarray(camera_intrinsic, dtype=numpy.float64)
+    p = numpy.asarray(t_cam_cube[:3, 3], dtype=numpy.float64).reshape(3)
+    z = float(p[2])
+    if z <= 0.05:
+        return False
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    u = fx * float(p[0]) / z + cx
+    v = fy * float(p[1]) / z + cy
+    h = int(image_shape_hw[0])
+    w = int(image_shape_hw[1])
+    m = float(margin_px)
+    return m <= u < w - m and m <= v < h - m
+
+
+def count_detections_by_nominal(dets: list[dict]) -> dict[float, int]:
+    """How many detections per nominal edge (for inventory sanity)."""
+    out: dict[float, int] = {}
+    for d in dets:
+        k = float(snap_edge_to_nominal(float(d["edge_m"])))
+        out[k] = out.get(k, 0) + 1
+    return out
 
 
 def flip_plane_to_robot_up(plane_model: numpy.ndarray, camera_pose: numpy.ndarray) -> numpy.ndarray:
@@ -597,6 +639,7 @@ def compute_cube_pose_o2(
         t_cam, pts, plane_model, camera_pose, edge_m
     )
     t_cam = refine_cube_pose_bound_center_cam(pts, t_cam, bound_center_iters_after_icp(edge_m))
+    # P_cam = T_cam_robot @ P_robot and P_cam = T_cam_cube @ P_cube  →  T_robot_cube = T_robot_cam @ T_cam_cube
     T_cam_robot = numpy.asarray(camera_pose, dtype=numpy.float64)
     t_robot = numpy.linalg.inv(T_cam_robot) @ t_cam
     return t_robot, t_cam
@@ -605,7 +648,10 @@ def compute_cube_pose_o2(
 def dedupe_detections(dets: list[dict]) -> list[dict]:
     if len(dets) <= 1:
         return dets
-    ordered = sorted(dets, key=lambda d: (-float(d["edge_m"]), -float(d["t_robot"][0, 3])))
+    ordered = sorted(
+        dets,
+        key=lambda d: (-float(snap_edge_to_nominal(float(d["edge_m"]))), -float(d["t_robot"][0, 3])),
+    )
     kept: list[dict] = []
     for d in ordered:
         p = numpy.asarray(d["t_robot"][:3, 3], dtype=numpy.float64)
@@ -662,20 +708,24 @@ def detect_cubes_once(
         ctr = numpy.asarray(t_robot[:3, 3], dtype=numpy.float64)
         if not is_center_on_playmat_robot(ctr):
             continue
+        if camera_intrinsic is not None and image is not None:
+            if not cube_center_visible_in_image(t_cam, camera_intrinsic, image.shape):
+                continue
         out.append({"t_robot": t_robot, "t_cam": t_cam, "edge_m": float(edge_m)})
     return dedupe_detections(out)
 
 
 def preplan_route(dets: list[dict]) -> list[tuple[numpy.ndarray, float]]:
     """
-    Fixed pick order: **largest nominal edge first**, then more -X (table left) as tie-break.
+    Pick order: **nominal** size large → medium → small (three of each in the challenge),
+    then tie-break **−X** (more negative / table left first) within each nominal size.
     Returns list of (center_xyz, edge_m) length <= 9.
     """
     if not dets:
         return []
     ranked = sorted(
         dets,
-        key=lambda d: (-float(d["edge_m"]), -float(d["t_robot"][0, 3])),
+        key=lambda d: (-float(snap_edge_to_nominal(float(d["edge_m"]))), -float(d["t_robot"][0, 3])),
     )
     ranked = ranked[:TOTAL_CUBES]
     return [(numpy.asarray(d["t_robot"][:3, 3], dtype=numpy.float64).copy(), float(d["edge_m"])) for d in ranked]
@@ -712,8 +762,8 @@ def fallback_pick_for_step(
     planned_edge: float,
 ) -> dict | None:
     """
-    If strict nominal match failed: prefer same nominal edge anyway (nearest XY),
-    then soft raw-edge tolerance — never “just take largest edge” (wrong colour/size).
+    If strict nominal match failed: prefer same nominal edge anyway (nearest XY) within
+    ``FALLBACK_MAX_DIST_M``, then soft raw-edge tolerance — never “just take largest edge”.
     """
     if not dets:
         return None
@@ -722,10 +772,13 @@ def fallback_pick_for_step(
 
     same_nominal = [d for d in dets if snap_edge_to_nominal(float(d["edge_m"])) == pe]
     if same_nominal:
-        return min(
+        best = min(
             same_nominal,
             key=lambda d: float(numpy.linalg.norm(numpy.asarray(d["t_robot"][:3, 3]) - pc)),
         )
+        d_xy = float(numpy.linalg.norm(numpy.asarray(best["t_robot"][:3, 3]) - pc))
+        if d_xy <= FALLBACK_MAX_DIST_M:
+            return best
 
     soft = [
         d
@@ -733,10 +786,13 @@ def fallback_pick_for_step(
         if abs(float(d["edge_m"]) - float(planned_edge)) < MATCH_EDGE_SOFT_TOL_M
     ]
     if soft:
-        return min(
+        best = min(
             soft,
             key=lambda d: float(numpy.linalg.norm(numpy.asarray(d["t_robot"][:3, 3]) - pc)),
         )
+        d_xy = float(numpy.linalg.norm(numpy.asarray(best["t_robot"][:3, 3]) - pc))
+        if d_xy <= FALLBACK_MAX_DIST_M:
+            return best
     return None
 
 
@@ -783,7 +839,7 @@ def grasp_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
     arm.open_lite6_gripper()
     time.sleep(GRIPPER_SETTLE_GRASP_S)
     set_line(arm, x_mm, y_mm, safe_z_mm, yaw_use, ARM_SPEED_TRAVEL)
-    # Pre-touch height: stay below safe clearance; at least ~0.5 mm above grasp for wiggle + final plunge.
+    # Pre-touch height: stay below safe clearance; at least ~0.5 mm above grasp, then final plunge.
     pre_touch_z = min(
         grasp_z_mm + float(GRASP_FINAL_APPROACH_MM),
         float(safe_z_mm) - 1.0,
@@ -791,14 +847,6 @@ def grasp_cube(arm, cube_pose, tower_top_z_m, cube_height_m):
     pre_touch_z = max(pre_touch_z, grasp_z_mm + 0.5)
     if pre_touch_z > grasp_z_mm + 0.2:
         set_line(arm, x_mm, y_mm, pre_touch_z, yaw_use, ARM_SPEED_GRASP_CUBE_LEVEL)
-        w = float(GRASP_WIGGLE_XY_MM)
-        for dx, dy in ((w, 0.0), (-w, 0.0), (0.0, w), (0.0, -w), (0.0, 0.0)):
-            set_line(arm, x_mm + dx, y_mm + dy, pre_touch_z, yaw_use, ARM_SPEED_GRASP_WIGGLE)
-        yw = float(GRASP_WIGGLE_YAW_DEG)
-        if yw > 0.05:
-            set_line(arm, x_mm, y_mm, pre_touch_z, yaw_use + yw, ARM_SPEED_GRASP_WIGGLE)
-            set_line(arm, x_mm, y_mm, pre_touch_z, yaw_use - yw, ARM_SPEED_GRASP_WIGGLE)
-            set_line(arm, x_mm, y_mm, pre_touch_z, yaw_use, ARM_SPEED_GRASP_WIGGLE)
         set_line(arm, x_mm, y_mm, grasp_z_mm, yaw_use, ARM_SPEED_GRASP_DESCEND_FINAL)
     else:
         set_line(arm, x_mm, y_mm, grasp_z_mm, yaw_use, ARM_SPEED_GRASP_DESCEND_FINAL)
@@ -876,11 +924,13 @@ def run_challenge_o2(
             print("No cubes detected.")
             return 0
         route = preplan_route(d0)
+        cnt = count_detections_by_nominal(d0)
         disp = img.copy()
         for d in d0:
             draw_pose_axes(disp, camera_intrinsic, d["t_cam"])
         lines = [
-            f"cubes={len(d0)}  route order: largest->smallest ({len(route)} steps)",
+            f"cubes={len(d0)}  route: 3x30mm -> 3x25mm -> 3x22.5mm (nominal), steps={len(route)}",
+            f"per-size counts {cnt} (expect 3 each)",
             "press k to run, other key abort",
         ]
         cv2.namedWindow("o2_RRC", cv2.WINDOW_NORMAL)
@@ -910,7 +960,11 @@ def run_challenge_o2(
             if not route:
                 print("No cubes to plan.")
                 break
-            print(f"Planned route: {len(route)} picks (largest -> smallest).")
+            cnt = count_detections_by_nominal(dets)
+            print(f"Planned route: {len(route)} picks (nominal large x3, medium x3, small x3). Counts: {cnt}")
+            for em, n in cnt.items():
+                if n != CUBES_PER_NOMINAL_SIZE:
+                    print(f"  Warning: expected {CUBES_PER_NOMINAL_SIZE} cubes at {em:.4f} m, saw {n}.")
 
         if placed >= len(route):
             break
@@ -927,6 +981,11 @@ def run_challenge_o2(
         if pick is None:
             print(f"Step {placed + 1}: no detection matches planned edge {pe:.4f} m — stopping.")
             break
+
+        if camera_intrinsic is not None and zed.image is not None:
+            if not cube_center_visible_in_image(pick["t_cam"], camera_intrinsic, zed.image.shape):
+                print(f"Step {placed + 1}: cube pose does not project into image — skip grasp (bad pose).")
+                break
 
         h_m = float(pick["edge_m"])
         t_src = pick["t_robot"]
