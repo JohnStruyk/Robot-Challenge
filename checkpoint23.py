@@ -5,12 +5,25 @@ from xarm.wrapper import XArmAPI
 
 from utils.vis_utils import draw_pose_axes
 from utils.zed_camera import ZedCamera
-from checkpoint0 import get_transform_camera_robot
+from checkpoint0 import TAG_CENTER_COORDINATES, get_transform_camera_robot
 from checkpoint1 import grasp_cube, place_cube, GRIPPER_LENGTH, robot_ip
 from best_RRC1 import grasp_cube_fast, place_cube_fast
 
 CUBE_SIZE = 0.025
 STACK_HEIGHT_GOAL = 9
+
+# Camera-frame depth band (meters after mm→m scaling) — drops far wall / floor junk outside workspace.
+GPU_Z_MIN_M = 0.28
+GPU_Z_MAX_M = 1.4
+
+# Play mat = axis-aligned rectangle from AprilTag centers (robot XY), with inset.
+_TAG_CENTERS_XY = numpy.asarray(TAG_CENTER_COORDINATES, dtype=numpy.float64)
+PLAY_AREA_XY_MARGIN_M = 0.015
+PLAY_AREA_X_MIN_M = float(_TAG_CENTERS_XY[:, 0].min() + PLAY_AREA_XY_MARGIN_M)
+PLAY_AREA_X_MAX_M = float(_TAG_CENTERS_XY[:, 0].max() - PLAY_AREA_XY_MARGIN_M)
+PLAY_AREA_Y_MIN_M = float(_TAG_CENTERS_XY[:, 1].min() + PLAY_AREA_XY_MARGIN_M)
+PLAY_AREA_Y_MAX_M = float(_TAG_CENTERS_XY[:, 1].max() - PLAY_AREA_XY_MARGIN_M)
+WORKSPACE_Z_ROBOT_M = (-0.12, 0.48)
 
 
 
@@ -20,6 +33,36 @@ MID_CUBE_SIZE = 0.025
 MID_CUBES_GOAL = 3
 BIG_CUBE_SIZE = 0.03
 BIG_CUBES_GOAL = 3
+
+
+def filter_points_playmat_cam_frame(pts_m: numpy.ndarray, T_cam_robot: numpy.ndarray) -> numpy.ndarray:
+    """Keep points whose robot/world position lies inside the tag-bounded play mat."""
+    if pts_m.shape[0] == 0:
+        return pts_m
+    T_robot_cam = numpy.linalg.inv(numpy.asarray(T_cam_robot, dtype=numpy.float64))
+    hom = numpy.ones((pts_m.shape[0], 4), dtype=numpy.float64)
+    hom[:, :3] = pts_m
+    pr = (T_robot_cam @ hom.T).T[:, :3]
+    z0, z1 = WORKSPACE_Z_ROBOT_M
+    m = (
+        (pr[:, 0] >= PLAY_AREA_X_MIN_M)
+        & (pr[:, 0] <= PLAY_AREA_X_MAX_M)
+        & (pr[:, 1] >= PLAY_AREA_Y_MIN_M)
+        & (pr[:, 1] <= PLAY_AREA_Y_MAX_M)
+        & (pr[:, 2] >= z0)
+        & (pr[:, 2] <= z1)
+    )
+    return pts_m[m]
+
+
+def is_center_on_playmat_robot(p_robot_xyz: numpy.ndarray) -> bool:
+    x, y, z = float(p_robot_xyz[0]), float(p_robot_xyz[1]), float(p_robot_xyz[2])
+    z0, z1 = WORKSPACE_Z_ROBOT_M
+    return (
+        (PLAY_AREA_X_MIN_M <= x <= PLAY_AREA_X_MAX_M)
+        and (PLAY_AREA_Y_MIN_M <= y <= PLAY_AREA_Y_MAX_M)
+        and (z0 <= z <= z1)
+    )
 
 
 def points_to_meters_open3d(xyz):
@@ -166,8 +209,8 @@ def get_cube_transforms(observation, camera_intrinsic, camera_pose):
     Returns
     -------
     tuple
-        On success: ``((t_robot_cube, t_cam_cube), status_message)``.
-        On failure: ``(None, status_message)``.
+        ``(list_of_(t_robot, t_cam), status_str)`` on success (list may be short).
+        ``(None, status_str)`` on hard failure (no cloud / clustering failed).
     """
     image, point_cloud = observation
     if image is None or point_cloud is None:
@@ -181,30 +224,43 @@ def get_cube_transforms(observation, camera_intrinsic, camera_pose):
         return None, f"too few finite points: {valid_points.shape[0]}"
 
     valid_points_m, _scale = points_to_meters_open3d(valid_points)
+    zm = valid_points_m[:, 2]
+    valid_points_m = valid_points_m[(zm > GPU_Z_MIN_M) & (zm < GPU_Z_MAX_M)]
+    if valid_points_m.shape[0] < 100:
+        return None, f"too few points after Z band: {valid_points_m.shape[0]}"
+
+    valid_points_m = filter_points_playmat_cam_frame(valid_points_m, camera_pose)
+    if valid_points_m.shape[0] < 100:
+        return None, f"too few points after play-mat crop: {valid_points_m.shape[0]}"
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(valid_points_m)
 
-    cube_pcds, _ = isolate_cube_cluster_open3d(pcd, num_cubes=STACK_HEIGHT_GOAL)
+    cube_pcds, status = isolate_cube_cluster_open3d(pcd, num_cubes=STACK_HEIGHT_GOAL)
+    if cube_pcds is None:
+        return None, status or "clustering failed"
 
     transforms = []
 
-    for pcd in cube_pcds:
-        # compute size using OBB
-        obb = pcd.get_oriented_bounding_box()
+    for cp in cube_pcds:
+        obb = cp.get_oriented_bounding_box()
         extent = numpy.asarray(obb.extent)
-        size = float(numpy.max(extent))  # largest dimension of cube
+        size = float(numpy.max(extent))
 
-        t = get_cube_transform(pcd, camera_pose)
+        t = get_cube_transform(cp, camera_pose)
 
-        if t is not None:
-            transforms.append((size, t))
+        if t is None:
+            continue
+        t_robot, _t_cam = t
+        if not is_center_on_playmat_robot(numpy.asarray(t_robot[:3, 3], dtype=numpy.float64)):
+            continue
+        transforms.append((size, t))
 
-    # sort from biggest → smallest
     transforms.sort(key=lambda x: x[0], reverse=True)
+    transforms = transforms[:STACK_HEIGHT_GOAL]
 
-    # strip size, return only transforms
-    return [t for (_, t) in transforms]
+    out = [t for (_, t) in transforms]
+    return out, f"{len(out)} cube(s) on play mat (cap {STACK_HEIGHT_GOAL})"
 
 
 def draw_status_overlay(image_bgra, lines, color=(0, 220, 0)):
@@ -250,7 +306,7 @@ def run_pure_vision_perception(cv_image, point_cloud, camera_intrinsic):
     if cv_image is None:
         blank = numpy.zeros((720, 1280, 4), dtype=numpy.uint8)
         disp = draw_status_overlay(blank, ["ZED image is None"], (0, 0, 255))
-        return None, None, disp, "no image"
+        return [], disp
 
     t_cam_robot = get_transform_camera_robot(cv_image, camera_intrinsic)
     if t_cam_robot is None:
@@ -259,22 +315,24 @@ def run_pure_vision_perception(cv_image, point_cloud, camera_intrinsic):
             ["Calibration FAILED (checkpoint0 tags / PnP)"],
             (0, 0, 255),
         )
-        return None, None, disp, "calibration failed"
+        return [], disp
 
-
-    cube_transforms = get_cube_transforms(
+    cube_transforms, status = get_cube_transforms(
         (cv_image, point_cloud), camera_intrinsic, t_cam_robot
     )
-
-    t_robot_cube, t_cam_cube = cube_transforms[0]
+    if cube_transforms is None:
+        cube_transforms = []
+        lines = [status or "perception failed"]
+        disp = draw_status_overlay(cv_image.copy(), lines, (0, 0, 255))
+        return [], disp
 
     lines = [
-        "LALALALALA"
+        status,
+        "play mat crop + Z band; poses filtered to mat centers",
     ]
     disp = cv_image.copy()
-
     for transform in cube_transforms:
-        t_cam_cube = transform[1]
+        _t_robot, t_cam_cube = transform
         if t_cam_cube is not None and numpy.isfinite(t_cam_cube).all():
             draw_pose_axes(disp, camera_intrinsic, t_cam_cube)
     disp = draw_status_overlay(disp, lines, (0, 220, 0))
@@ -302,15 +360,22 @@ def main():
             cv_image, point_cloud, camera_intrinsic
         )
 
-        t_robot_cube, _t_cam_cube = cube_transforms[0]
-
-        t_robot_cube_2, _ = cube_transforms[1]
-
-
         cv2.namedWindow("Verifying Cube Pose", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Verifying Cube Pose", 1280, 720)
         cv2.imshow("Verifying Cube Pose", disp)
         key = cv2.waitKey(0)
+
+        need = STACK_HEIGHT_GOAL
+        if len(cube_transforms) < need:
+            print(
+                f"Need {need} cubes in play area, got {len(cube_transforms)} — adjust scene or tags."
+            )
+            if key == ord("k"):
+                print("Not running motion with incomplete detections.")
+            cv2.destroyAllWindows()
+            return
+
+        t_robot_cube, _t_cam_cube = cube_transforms[0]
 
         if key == ord("k") and t_robot_cube is not None:
             cv2.destroyAllWindows()
