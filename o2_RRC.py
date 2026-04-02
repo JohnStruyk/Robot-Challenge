@@ -9,8 +9,11 @@ o2_RRC — challenge 2 (minimal): AprilTag (checkpoint0), cluster cubes, snap ed
     that horizontal direction is **+X**; **+Y = Z × X** (90° in the table plane).
   - Center: median bottom ``(x,y)`` and ``z = median(bottom z) + edge/2``.
 
-**Playmat**: Dense points are cropped to the checkpoint8 robot-frame AABB before
-clustering; each cluster median and final pose center must lie in that box.
+**Play area**: Dense points and detections are cropped to the **white mat** in world
+frame — the axis-aligned rectangle spanned by the **four** AprilTag centers in
+``checkpoint0.TAG_CENTER_COORDINATES`` (PnP can use 3+ tags; the spatial gate always
+uses this full rectangle so nothing off-mat is clustered). Small XY margin inset
+avoids the tag markers themselves.
 
 **Route**: Largest → smallest (nominal edge, then X); each step matches the planned
 center. **Grasp**: yaw snapped to 90°.
@@ -34,7 +37,7 @@ import open3d as o3d
 from scipy.spatial.transform import Rotation
 from xarm.wrapper import XArmAPI
 
-from checkpoint0 import get_transform_camera_robot
+from checkpoint0 import TAG_CENTER_COORDINATES, get_transform_camera_robot
 from checkpoint1 import GRIPPER_LENGTH, robot_ip
 from orientation_RRC import (
     BOTTOM_LAYER_FRAC,
@@ -90,10 +93,16 @@ GPU_Z_MIN_M = 0.28
 GPU_Z_MAX_M = 1.4
 DENSE_CROP_MARGIN_M = 0.006
 
-# Arena / play mat in robot–world frame (meters), same as checkpoint8 — drops wall / floor beyond mat.
-PLAY_MAT_X_ROBOT_M = (-0.10, 0.52)
-PLAY_MAT_Y_ROBOT_M = (-0.55, 0.55)
-PLAY_MAT_Z_ROBOT_M = (-0.12, 0.48)
+# White play mat = axis-aligned rectangle through the four AprilTag centers (world XY, meters).
+_TAG_CENTERS_XY = numpy.asarray(TAG_CENTER_COORDINATES, dtype=numpy.float64)
+# Inset from tag layout so tag plastic / border is not clustered as cubes.
+PLAY_AREA_XY_MARGIN_M = 0.015
+PLAY_AREA_X_MIN_M = float(_TAG_CENTERS_XY[:, 0].min() + PLAY_AREA_XY_MARGIN_M)
+PLAY_AREA_X_MAX_M = float(_TAG_CENTERS_XY[:, 0].max() - PLAY_AREA_XY_MARGIN_M)
+PLAY_AREA_Y_MIN_M = float(_TAG_CENTERS_XY[:, 1].min() + PLAY_AREA_XY_MARGIN_M)
+PLAY_AREA_Y_MAX_M = float(_TAG_CENTERS_XY[:, 1].max() - PLAY_AREA_XY_MARGIN_M)
+# Vertical band (robot Z): table surface + cubes; independent of tag XY layout.
+WORKSPACE_Z_ROBOT_M = (-0.12, 0.48)
 
 # Match live cube to planned step (meters)
 MATCH_MAX_DIST_M = 0.055
@@ -141,21 +150,19 @@ def points_to_scene_meters(point_cloud, camera_pose: numpy.ndarray | None = None
 
 
 def filter_points_playmat_cam_frame(pts_m: numpy.ndarray, T_cam_robot: numpy.ndarray) -> numpy.ndarray:
-    """Keep camera-frame points whose robot/world position lies on the play mat (excludes background)."""
+    """Keep camera-frame points whose world/robot position lies inside the tag-bounded play mat."""
     if pts_m.shape[0] == 0:
         return pts_m
     T_robot_cam = numpy.linalg.inv(numpy.asarray(T_cam_robot, dtype=numpy.float64))
     hom = numpy.ones((pts_m.shape[0], 4), dtype=numpy.float64)
     hom[:, :3] = pts_m
     pr = (T_robot_cam @ hom.T).T[:, :3]
-    x0, x1 = PLAY_MAT_X_ROBOT_M
-    y0, y1 = PLAY_MAT_Y_ROBOT_M
-    z0, z1 = PLAY_MAT_Z_ROBOT_M
+    z0, z1 = WORKSPACE_Z_ROBOT_M
     m = (
-        (pr[:, 0] >= x0)
-        & (pr[:, 0] <= x1)
-        & (pr[:, 1] >= y0)
-        & (pr[:, 1] <= y1)
+        (pr[:, 0] >= PLAY_AREA_X_MIN_M)
+        & (pr[:, 0] <= PLAY_AREA_X_MAX_M)
+        & (pr[:, 1] >= PLAY_AREA_Y_MIN_M)
+        & (pr[:, 1] <= PLAY_AREA_Y_MAX_M)
         & (pr[:, 2] >= z0)
         & (pr[:, 2] <= z1)
     )
@@ -164,10 +171,12 @@ def filter_points_playmat_cam_frame(pts_m: numpy.ndarray, T_cam_robot: numpy.nda
 
 def is_center_on_playmat_robot(p_robot_xyz: numpy.ndarray) -> bool:
     x, y, z = float(p_robot_xyz[0]), float(p_robot_xyz[1]), float(p_robot_xyz[2])
-    x0, x1 = PLAY_MAT_X_ROBOT_M
-    y0, y1 = PLAY_MAT_Y_ROBOT_M
-    z0, z1 = PLAY_MAT_Z_ROBOT_M
-    return (x0 <= x <= x1) and (y0 <= y <= y1) and (z0 <= z <= z1)
+    z0, z1 = WORKSPACE_Z_ROBOT_M
+    return (
+        (PLAY_AREA_X_MIN_M <= x <= PLAY_AREA_X_MAX_M)
+        and (PLAY_AREA_Y_MIN_M <= y <= PLAY_AREA_Y_MAX_M)
+        and (z0 <= z <= z1)
+    )
 
 
 def cluster_median_robot(
