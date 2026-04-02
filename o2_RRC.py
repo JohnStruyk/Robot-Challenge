@@ -11,7 +11,8 @@ frame). Cube pose ``T_cam_cube`` maps cube frame to camera. Then **T_robot_cube 
 
 **Perception**: Points cropped to the play mat. **Yaw** no longer comes from ``cv2.minAreaRect`` on a
 near-square footprint (that is ambiguous and often ~45° off). Instead: **per-cluster table plane**
-refit, **3D OBB** axes with cube **Z** pinned to the table normal, **multi-hypothesis ICP** (four 90°
+refit, cube **+Z** = table normal; **+X** = outward normal of the **dominant vertical side face**
+estimated from depth (not aligned to the camera). **Multi-hypothesis ICP** (four 90°
 rotations around vertical to escape symmetric local minima), then footprint blend. Optional **CuPy**
 accelerates large point projections when installed.
 
@@ -205,15 +206,124 @@ def refine_plane_from_cluster_bottom_points(
     return flip_plane_to_robot_up(pn, camera_pose)
 
 
-def rotation_from_obb_pin_z_up(pts_cam: numpy.ndarray, n_up_cam: numpy.ndarray) -> numpy.ndarray | None:
+def _horizontal_unit(v3: numpy.ndarray, n_up: numpy.ndarray) -> numpy.ndarray | None:
+    v = v3 - numpy.dot(v3, n_up) * n_up
+    vn = float(numpy.linalg.norm(v))
+    if vn < 1e-9:
+        return None
+    return v / vn
+
+
+def rotation_from_vertical_side_faces(
+    pts_cam: numpy.ndarray,
+    n_up_cam: numpy.ndarray,
+    center_cam: numpy.ndarray,
+    plane_model: numpy.ndarray,
+) -> numpy.ndarray | None:
     """
-    Cube rotation in camera frame from 3D OBB: cube +Z aligns with table normal ``n_up_cam``.
-    Avoids minAreaRect on a **square** footprint (degenerate / ~45° jumps).
+    Cube frame: **+Z** = table up ``n_up_cam``; **+X** = unit outward normal of the **most
+    sampled vertical face** (from point normals on a mid-height band), not aligned to the
+    camera. Opposite face normals are merged (mod π), then the strongest bin wins.
+    """
+    if pts_cam.shape[0] < 30:
+        return None
+    z_axis = numpy.asarray(n_up_cam, dtype=numpy.float64).reshape(3)
+    z_axis = z_axis / (numpy.linalg.norm(z_axis) + 1e-12)
+    c = numpy.asarray(center_cam, dtype=numpy.float64).reshape(3)
+    pm = numpy.asarray(plane_model, dtype=numpy.float64)
+    h = _signed_plane_dist(pts_cam, pm)
+    h_min = float(numpy.min(h))
+    h_max = float(numpy.max(h))
+    span = max(h_max - h_min, 1e-9)
+    lo = h_min + 0.14 * span
+    hi = h_max - 0.08 * span
+    mask = (h >= lo) & (h <= hi)
+    if int(numpy.sum(mask)) < 18:
+        lo = h_min + 0.10 * span
+        hi = h_max - 0.06 * span
+        mask = (h >= lo) & (h <= hi)
+    idx = numpy.nonzero(mask)[0]
+    if idx.shape[0] < 12:
+        return None
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts_cam[idx].astype(numpy.float64))
+    try:
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.0075, max_nn=24)
+        )
+    except Exception:
+        return None
+    nh_full = numpy.asarray(pcd.normals, dtype=numpy.float64)
+    rad = pts_cam[idx] - c[None, :]
+    rad = rad - numpy.dot(rad, z_axis)[:, None] * z_axis[None, :]
+    rn = numpy.linalg.norm(rad, axis=1)
+    rad_u = rad / (rn[:, None] + 1e-9)
+    nh_full = numpy.where(numpy.sum(nh_full * rad_u[:, None], axis=1, keepdims=True) < 0.0, -nh_full, nh_full)
+    cosz = numpy.abs(numpy.dot(nh_full, z_axis))
+    m_side = cosz < 0.58
+    nh = nh_full[m_side]
+    if nh.shape[0] < 10:
+        nh = nh_full[cosz < 0.72]
+    if nh.shape[0] < 6:
+        return None
+    horiz = nh - numpy.dot(nh, z_axis)[:, None] * z_axis[None, :]
+    hn = numpy.linalg.norm(horiz, axis=1)
+    m_h = hn > 1e-7
+    horiz = horiz[m_h] / hn[m_h, None]
+    if horiz.shape[0] < 5:
+        return None
+    e1, e2 = _in_plane_basis(z_axis)
+    u = numpy.dot(horiz, e1)
+    w = numpy.dot(horiz, e2)
+    theta = numpy.arctan2(w, u)
+    theta_fold = numpy.mod(theta, numpy.pi)
+    nb = 20
+    hist, edges = numpy.histogram(theta_fold, bins=nb, range=(0.0, numpy.pi))
+    peak = int(numpy.argmax(hist))
+    lo_a, hi_a = float(edges[peak]), float(edges[peak + 1])
+    sel = (theta_fold >= lo_a) & (theta_fold < hi_a)
+    if int(numpy.sum(sel)) < 3:
+        da = float(numpy.pi) / float(nb) * 1.25
+        sel = (theta_fold >= max(0.0, lo_a - da)) & (theta_fold <= min(numpy.pi, hi_a + da))
+    v_sel = horiz[sel]
+    n_face = numpy.mean(v_sel, axis=0)
+    nf = float(numpy.linalg.norm(n_face))
+    if nf < 0.25:
+        return None
+    x_axis = n_face / nf
+    x_axis = x_axis - numpy.dot(x_axis, z_axis) * z_axis
+    x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
+    y_axis = numpy.cross(z_axis, x_axis)
+    y_axis = y_axis / (numpy.linalg.norm(y_axis) + 1e-12)
+    x_axis = numpy.cross(y_axis, z_axis)
+    x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
+    return orthonormalize_rotation(numpy.column_stack([x_axis, y_axis, z_axis]))
+
+
+def rotation_from_obb_with_side_radial_hint(
+    pts_cam: numpy.ndarray,
+    n_up_cam: numpy.ndarray,
+    center_cam: numpy.ndarray,
+    plane_model: numpy.ndarray,
+) -> numpy.ndarray | None:
+    """
+    OBB fallback: **+Z** = table normal. **+X** is chosen between the two horizontal OBB
+    directions by **agreement with horizontal radials** from ``center_cam`` to side-band
+    points (geometry only — not camera optical axis).
     """
     if pts_cam.shape[0] < 30:
         return None
     n_up_cam = numpy.asarray(n_up_cam, dtype=numpy.float64).reshape(3)
     n_up_cam = n_up_cam / (numpy.linalg.norm(n_up_cam) + 1e-12)
+    c = numpy.asarray(center_cam, dtype=numpy.float64).reshape(3)
+    pm = numpy.asarray(plane_model, dtype=numpy.float64)
+    h = _signed_plane_dist(pts_cam, pm)
+    h_min = float(numpy.min(h))
+    h_max = float(numpy.max(h))
+    span = max(h_max - h_min, 1e-9)
+    lo = h_min + 0.12 * span
+    hi = h_max - 0.07 * span
+    side_mask = (h >= lo) & (h <= hi)
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts_cam.astype(numpy.float64))
     try:
@@ -237,26 +347,46 @@ def rotation_from_obb_pin_z_up(pts_cam: numpy.ndarray, n_up_cam: numpy.ndarray) 
     if float(numpy.dot(z_axis, n_up_cam)) < 0.0:
         z_axis = -z_axis
     z_axis = z_axis / (numpy.linalg.norm(z_axis) + 1e-12)
-    x_axis = None
-    x_norm = 0.0
+    cand_x: list[numpy.ndarray] = []
     for i in range(3):
         if i == best_i:
             continue
         v = axes[i]
         x_proj = v - numpy.dot(v, z_axis) * z_axis
         xn = float(numpy.linalg.norm(x_proj))
-        if xn > x_norm + 1e-9:
-            x_norm = xn
-            x_axis = x_proj / xn
-    if x_axis is None or x_norm < 1e-8:
-        e1, e2 = _in_plane_basis(z_axis)
-        x_axis = e1 - numpy.dot(e1, z_axis) * z_axis
-        x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
+        if xn > 1e-8:
+            cand_x.append(x_proj / xn)
+    if not cand_x:
+        return None
+    x_axis = cand_x[0]
+    if len(cand_x) >= 2:
+        pts_side = pts_cam[side_mask] if int(numpy.sum(side_mask)) >= 8 else pts_cam
+        score = [0.0, 0.0]
+        for p in pts_side:
+            hu = _horizontal_unit(p - c, z_axis)
+            if hu is None:
+                continue
+            for j, cx in enumerate(cand_x[:2]):
+                score[j] += abs(float(numpy.dot(hu, cx)))
+        x_axis = cand_x[0] if score[0] >= score[1] else cand_x[1]
     y_axis = numpy.cross(z_axis, x_axis)
     y_axis = y_axis / (numpy.linalg.norm(y_axis) + 1e-12)
     x_axis = numpy.cross(y_axis, z_axis)
     x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
     return orthonormalize_rotation(numpy.column_stack([x_axis, y_axis, z_axis]))
+
+
+def initial_cube_rotation_from_geometry(
+    pts_cam: numpy.ndarray,
+    n_up_cam: numpy.ndarray,
+    center_cam: numpy.ndarray,
+    plane_model: numpy.ndarray,
+) -> numpy.ndarray | None:
+    """Prefer vertical-face normals; else OBB with side radial hint (no camera-facing bias)."""
+    R = rotation_from_vertical_side_faces(pts_cam, n_up_cam, center_cam, plane_model)
+    if R is not None:
+        return R
+    return rotation_from_obb_with_side_radial_hint(pts_cam, n_up_cam, center_cam, plane_model)
 
 
 def _nominal_edge_bucket(edge_m: float) -> str:
@@ -779,10 +909,10 @@ def compute_cube_pose_o2(
     edge_m: float,
 ) -> tuple[numpy.ndarray, numpy.ndarray] | None:
     """
-    **No** minAreaRect yaw on the square footprint (major source of ~45° errors). Pipeline:
-    per-cluster **plane refit**, **3D OBB** rotation with cube Z = table normal, translation
-    from **footprint centroid** + height snap, **multi-hypothesis ICP**, footprint blend,
-    bound-centering. Fallback: legacy ``physical_cube_pose_from_points`` rotation only if OBB fails.
+    **No** minAreaRect yaw on the square footprint. Pipeline: per-cluster **plane refit**,
+    rotation from **vertical side-face** evidence (normals) or **OBB + side radial** hint —
+    **never** bias +X toward the camera. Translation from **footprint centroid** + height snap,
+    **multi-hypothesis ICP**, footprint blend, bound-centering. Last resort: legacy physical yaw.
     """
     if pts.shape[0] < 30:
         return None
@@ -791,7 +921,7 @@ def compute_cube_pose_o2(
     n_up = pm[:3] / (numpy.linalg.norm(pm[:3]) + 1e-12)
 
     c_init = cube_center_from_bottom_footprint(pts, plane_ref, camera_pose, edge_m)
-    R_init = rotation_from_obb_pin_z_up(pts, n_up)
+    R_init = initial_cube_rotation_from_geometry(pts, n_up, c_init, plane_ref)
     if R_init is None:
         pair_fb = physical_cube_pose_from_points(
             pts,
