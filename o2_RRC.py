@@ -2,12 +2,11 @@
 o2_RRC — challenge 2 (minimal): AprilTag (checkpoint0), cluster cubes, snap edge to
 22.5 / 25 / 30 mm.
 
-**Cube pose (robot frame)** — fixed conventions:
-  - **+Z** is hardcoded to robot ``[0,0,1]`` (vertical up from the play mat).
-  - Bottom-face points (same layer selection as ``orientation_RRC``) are transformed
-    to the robot frame; **minAreaRect** on ``(x,y)`` picks the most likely face edge;
-    that horizontal direction is **+X**; **+Y = Z × X** (90° in the table plane).
-  - Center: median bottom ``(x,y)`` and ``z = median(bottom z) + edge/2``.
+**Cube pose** — ``orientation_RRC.physical_cube_pose_from_points`` (RANSAC table plane,
+bottom footprint, min-area yaw, bound centering in camera frame), then **extra**
+bound-centering iterations in ``o2_RRC``, then **snap** the center along the table
+normal so signed height matches ``h_min + edge/2`` (fixes depth drift). All in the
+same world frame as AprilTag PnP — **no** hardcoded robot ``[0,0,1]`` cube axis.
 
 **Play area**: Dense points and detections are cropped to the **white mat** in world
 frame — the axis-aligned rectangle spanned by the **four** AprilTag centers in
@@ -40,12 +39,11 @@ from xarm.wrapper import XArmAPI
 from checkpoint0 import TAG_CENTER_COORDINATES, get_transform_camera_robot
 from checkpoint1 import GRIPPER_LENGTH, robot_ip
 from orientation_RRC import (
-    BOTTOM_LAYER_FRAC,
     CUBE_SIZE_LARGE_M,
     CUBE_SIZE_MEDIUM_M,
     CUBE_SIZE_SMALL_M,
     isolate_cube_cluster_open3d,
-    orthonormalize_rotation,
+    physical_cube_pose_from_points,
     points_to_meters_open3d,
     _in_plane_basis,
     _project_points_to_plane,
@@ -91,7 +89,9 @@ TOTAL_CUBES = 9
 
 GPU_Z_MIN_M = 0.28
 GPU_Z_MAX_M = 1.4
-DENSE_CROP_MARGIN_M = 0.006
+DENSE_CROP_MARGIN_M = 0.008
+# Extra AABB-in-cube-frame passes after physical_cube_pose_from_points (orientation already uses BOUND_CENTER_ITERS).
+POSE_BOUND_CENTER_EXTRA_ITERS = 4
 
 # White play mat = axis-aligned rectangle through the four AprilTag centers (world XY, meters).
 _TAG_CENTERS_XY = numpy.asarray(TAG_CENTER_COORDINATES, dtype=numpy.float64)
@@ -242,119 +242,70 @@ def classify_nominal_edge(
     return snap_edge_to_nominal(pooled)
 
 
-def cube_pose_z_up_robot_face_minrect(
+def refine_cube_pose_bound_center_cam(
+    pts_cam: numpy.ndarray,
+    t_cam_cube: numpy.ndarray,
+    iters: int,
+) -> numpy.ndarray:
+    """More AABB-in-cube-frame centering (same idea as orientation_RRC BOUND_CENTER_ITERS)."""
+    R = t_cam_cube[:3, :3].copy()
+    c = t_cam_cube[:3, 3].copy()
+    for _ in range(max(0, int(iters))):
+        q = R.T @ (pts_cam - c[None, :]).T
+        delta = numpy.array(
+            [0.5 * (float(numpy.min(q[k])) + float(numpy.max(q[k]))) for k in range(3)],
+            dtype=numpy.float64,
+        )
+        if float(numpy.linalg.norm(delta)) < 1e-9:
+            break
+        c = c + R @ delta
+    out = numpy.copy(t_cam_cube)
+    out[:3, 3] = c
+    return out
+
+
+def snap_cube_center_along_plane_normal(
+    center_cam: numpy.ndarray,
     pts_cam: numpy.ndarray,
     plane_model: numpy.ndarray,
     camera_pose: numpy.ndarray,
-    *args,
-    **kwargs,
+    edge_m: float,
+) -> numpy.ndarray:
+    """
+    Move center along the table normal so signed plane distance matches ``h_min + edge/2``
+    (cube center halfway above the lowest surface samples).
+    """
+    pm = flip_plane_to_robot_up(plane_model, camera_pose)
+    h_pts = _signed_plane_dist(pts_cam, pm)
+    h_min = float(numpy.min(h_pts))
+    n = pm[:3] / (numpy.linalg.norm(pm[:3]) + 1e-12)
+    h_c = float(_signed_plane_dist(center_cam.reshape(1, 3), pm)[0])
+    target_h = h_min + float(edge_m) * 0.5
+    return numpy.asarray(center_cam, dtype=numpy.float64) + n * (target_h - h_c)
+
+
+def compute_cube_pose_o2(
+    pts: numpy.ndarray,
+    plane_model: numpy.ndarray,
+    camera_pose: numpy.ndarray,
+    edge_m: float,
 ) -> tuple[numpy.ndarray, numpy.ndarray] | None:
     """
-    Cube frame in **robot base**: Z = +world up; X from min-area rect long edge on the
-    bottom footprint (robot XY); Y = Z × X. Translation from bottom layer in robot frame.
-
-    Cube edge length: 4th positional or ``edge_m=`` (meters).
+    Table-plane physical pose, extra bound-centering, height snap along normal, robot transform.
     """
-    edge_m: float | None = None
-    if len(args) == 1:
-        edge_m = args[0]
-    elif len(args) > 1:
-        raise TypeError(
-            f"cube_pose_z_up_robot_face_minrect() takes at most 4 positional arguments ({len(args) + 3} given)"
-        )
-    if "edge_m" in kwargs:
-        if edge_m is not None:
-            raise TypeError("cube_pose_z_up_robot_face_minrect(): edge_m specified twice")
-        edge_m = kwargs.pop("edge_m")
-    if kwargs:
-        raise TypeError(
-            "cube_pose_z_up_robot_face_minrect() got unexpected keyword arguments: "
-            f"{sorted(kwargs.keys())}"
-        )
-    if edge_m is None:
+    if pts.shape[0] < 30:
         return None
-    edge_m = float(edge_m)
-
-    if pts_cam.shape[0] < 30:
+    pair = physical_cube_pose_from_points(pts, plane_model, camera_pose, edge_m)
+    if pair is None:
         return None
-
-    pm = flip_plane_to_robot_up(plane_model, camera_pose)
-    h = _signed_plane_dist(pts_cam, pm)
-    h_min = float(numpy.min(h))
-    h_max = float(numpy.max(h))
-    span = h_max - h_min
-    if span < 1e-6:
-        return None
-
-    thresh = h_min + BOTTOM_LAYER_FRAC * span
-    bottom_mask = h <= thresh
-    if int(numpy.sum(bottom_mask)) < 8:
-        thresh = numpy.percentile(h, 18.0)
-        bottom_mask = h <= thresh
-    if int(numpy.sum(bottom_mask)) < 5:
-        bottom_mask = numpy.ones(pts_cam.shape[0], dtype=bool)
-
-    p_bot_cam = pts_cam[bottom_mask]
+    _, t_cam = pair
+    t_cam = refine_cube_pose_bound_center_cam(pts, t_cam, POSE_BOUND_CENTER_EXTRA_ITERS)
+    c = snap_cube_center_along_plane_normal(t_cam[:3, 3], pts, plane_model, camera_pose, edge_m)
+    t_cam = numpy.copy(t_cam)
+    t_cam[:3, 3] = c
     T_cam_robot = numpy.asarray(camera_pose, dtype=numpy.float64)
-    T_robot_cam = numpy.linalg.inv(T_cam_robot)
-    hom = numpy.ones((p_bot_cam.shape[0], 4), dtype=numpy.float64)
-    hom[:, :3] = p_bot_cam
-    p_bot_robot = (T_robot_cam @ hom.T).T[:, :3]
-
-    # Hardcoded +Z cube = robot +up (play mat normal aligned with base Z).
-    z_robot = numpy.array([0.0, 0.0, 1.0], dtype=numpy.float64)
-
-    xy = p_bot_robot[:, :2].astype(numpy.float32)
-    x_axis_robot = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float64)
-    if xy.shape[0] >= 5:
-        rect = cv2.minAreaRect(xy)
-        box = cv2.boxPoints(rect).astype(numpy.float64)
-        e01 = box[1] - box[0]
-        e12 = box[2] - box[1]
-        n1 = float(numpy.linalg.norm(e01))
-        n2 = float(numpy.linalg.norm(e12))
-        if n1 < 1e-9 and n2 < 1e-9:
-            pass
-        else:
-            if n1 >= n2:
-                d2 = e01 / n1
-            else:
-                d2 = e12 / n2
-            x_axis_robot = numpy.array([float(d2[0]), float(d2[1]), 0.0], dtype=numpy.float64)
-            x_axis_robot /= numpy.linalg.norm(x_axis_robot) + 1e-12
-    else:
-        x_axis_robot /= numpy.linalg.norm(x_axis_robot) + 1e-12
-
-    # Orthogonal horizontal axis: Y = Z × X (right-handed, 90° from Z and X).
-    y_robot = numpy.cross(z_robot, x_axis_robot)
-    yn = numpy.linalg.norm(y_robot)
-    if yn < 1e-9:
-        x_axis_robot = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float64)
-        y_robot = numpy.cross(z_robot, x_axis_robot)
-        yn = numpy.linalg.norm(y_robot)
-    y_robot = y_robot / (yn + 1e-12)
-
-    # Re-orthogonalize X in the table plane (in case of numerical drift).
-    x_axis_robot = numpy.cross(y_robot, z_robot)
-    x_axis_robot /= numpy.linalg.norm(x_axis_robot) + 1e-12
-
-    R_robot = orthonormalize_rotation(
-        numpy.column_stack([x_axis_robot, y_robot, z_robot])
-    )
-
-    c_xy = numpy.median(p_bot_robot[:, :2], axis=0)
-    z_table = float(numpy.median(p_bot_robot[:, 2]))
-    c_robot = numpy.array(
-        [float(c_xy[0]), float(c_xy[1]), z_table + float(edge_m) * 0.5],
-        dtype=numpy.float64,
-    )
-
-    t_robot_cube = numpy.eye(4, dtype=numpy.float64)
-    t_robot_cube[:3, :3] = R_robot
-    t_robot_cube[:3, 3] = c_robot
-
-    t_cam_cube = T_cam_robot @ t_robot_cube
-    return t_robot_cube, t_cam_cube
+    t_robot = numpy.linalg.inv(T_cam_robot) @ t_cam
+    return t_robot, t_cam
 
 
 def dedupe_detections(dets: list[dict]) -> list[dict]:
@@ -405,7 +356,7 @@ def detect_cubes_once(
         if pts.shape[0] < 30:
             continue
         edge_m = classify_nominal_edge(pts, plane_np, camera_pose)
-        pose_pair = cube_pose_z_up_robot_face_minrect(pts, plane_np, camera_pose, edge_m)
+        pose_pair = compute_cube_pose_o2(pts, plane_np, camera_pose, edge_m)
         if pose_pair is None:
             continue
         t_robot, t_cam = pose_pair
