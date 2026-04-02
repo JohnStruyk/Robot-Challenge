@@ -1,29 +1,22 @@
 """
-o2_RRC — challenge 2 (minimal): AprilTag (checkpoint0), cluster cubes, snap edge to
-22.5 / 25 / 30 mm.
+o2_RRC — challenge 2 (minimal): AprilTag (checkpoint0), cluster cubes, nominal 22.5 / 25 / 30 mm.
 
-**Cube pose** — ``orientation_RRC.physical_cube_pose_from_points`` with **adaptive**
-parameters per nominal size (22.5 / 25 / 30 mm): bottom-layer fraction, bound iterations,
-``yaw_source`` (bottom vs full projected footprint vs blend), contact height percentile,
-refine↔snap cycles, and a **second** dense crop with size-specific margin after edge
-classification. Same AprilTag / world frame as PnP.
+**Perception model**: AprilTag PnP gives **camera ↔ world** (tag frame) at real scale.
+Points are cropped to the **tag rectangle** on the play mat. Each cluster is a cube
+candidate: **size** from height span + OBB (``classify_nominal_edge``). **Pose** is
+**(1)** ``physical_cube_pose_from_points`` (table plane, bottom footprint, min-area yaw)
+as a **seed**, **(2)** one bound-center + height snap along the plane normal, **(3)**
+**Open3D ICP**: a **synthetic cube mesh** (exact ``edge_m``) is registered to the
+measured cloud — this refines **position + orientation** for the actual camera angle
+and play-mat geometry without hand-tuned cardinal snaps.
 
-**Play area**: Dense points and detections are cropped to the **white mat** in world
-frame — the axis-aligned rectangle spanned by the **four** AprilTag centers in
-``checkpoint0.TAG_CENTER_COORDINATES`` (PnP can use 3+ tags; the spatial gate always
-uses this full rectangle so nothing off-mat is clustered). Small XY margin inset
-avoids the tag markers themselves.
-
-**Route**: Largest → smallest (nominal edge, then X). Each step matches **nominal**
-edge (22.5 / 25 / 30 mm) then nearest XY — not raw float tolerance. Orientation is
-snapped to **AprilTag world** axes (+Z up, X/Y along mat cardinals). **Grasp**: yaw
-snapped to 90° on top of that.
+**Route**: Largest → smallest; match by **nominal** edge + nearest XY. **Grasp**: yaw
+snapped to 90°.
 """
 from __future__ import annotations
 
 import os
 import sys
-from typing import NamedTuple
 import time
 import traceback
 
@@ -101,56 +94,18 @@ MEDIUM_DENSE_CROP_MARGIN_M = 0.008
 LARGE_DENSE_CROP_MARGIN_M = 0.012
 LARGE_CLUSTER_MIN_EXTENT_M = 0.027
 
+# Open3D ICP: synthetic cube mesh → measured cluster (camera frame, meters).
+ICP_MESH_SAMPLES = 2800
+ICP_VOXEL_M = 0.0025
+ICP_MAX_CORR_COARSE_M = 0.020
+ICP_MAX_CORR_FINE_M = 0.007
+ICP_COARSE_ITERS = 55
+ICP_FINE_ITERS = 45
+ICP_MIN_FITNESS = 0.12
 
-class CubePoseParams(NamedTuple):
-    """Adaptive pose/orientation pipeline for one nominal cube size."""
-
-    bottom_layer_frac: float | None  # None → orientation_RRC.BOTTOM_LAYER_FRAC
-    bound_center_iters: int | None  # None → orientation_RRC.BOUND_CENTER_ITERS
-    extra_bound_iters: int
-    h_contact_percentile: float  # 0 = use min(h); else percentile for contact height
-    refine_snap_cycles: int
-    yaw_source: str  # bottom | full | blend (see physical_cube_pose_from_points)
-
-
-# 22.5 mm: sparse cloud — thicker bottom band, yaw from full projected footprint, tight crop, robust contact.
-POSE_PARAMS_SMALL = CubePoseParams(
-    bottom_layer_frac=0.28,
-    bound_center_iters=5,
-    extra_bound_iters=5,
-    h_contact_percentile=1.0,
-    refine_snap_cycles=2,
-    yaw_source="full",
-)
-# 25 mm: default orientation_RRC behavior.
-POSE_PARAMS_MEDIUM = CubePoseParams(
-    bottom_layer_frac=None,
-    bound_center_iters=None,
-    extra_bound_iters=4,
-    h_contact_percentile=0.0,
-    refine_snap_cycles=1,
-    yaw_source="bottom",
-)
-# 30 mm: thin contact slice; blend bottom+full yaw (large blue often has noisy bottom band).
-POSE_PARAMS_LARGE = CubePoseParams(
-    bottom_layer_frac=0.12,
-    bound_center_iters=7,
-    extra_bound_iters=9,
-    h_contact_percentile=3.5,
-    refine_snap_cycles=2,
-    yaw_source="blend",
-)
-
-
-def pose_params_for_nominal_edge(edge_m: float) -> CubePoseParams:
-    e = float(edge_m)
-    if abs(e - float(CUBE_SIZE_SMALL_M)) < 1.5e-3:
-        return POSE_PARAMS_SMALL
-    if abs(e - float(CUBE_SIZE_MEDIUM_M)) < 1.5e-3:
-        return POSE_PARAMS_MEDIUM
-    if abs(e - float(CUBE_SIZE_LARGE_M)) < 1.5e-3:
-        return POSE_PARAMS_LARGE
-    return POSE_PARAMS_MEDIUM
+# Pre-ICP physical init: single pipeline; ICP does the fine alignment.
+PHYSICAL_INIT_BOUND_EXTRA = 4
+PHYSICAL_INIT_YAW_SOURCE = "bottom"
 
 
 def dense_margin_for_nominal_edge(edge_m: float) -> float:
@@ -349,37 +304,85 @@ def classify_nominal_edge(
     return float(edge_from_height)
 
 
-def snap_cube_pose_to_tag_world_axes(t_robot: numpy.ndarray) -> numpy.ndarray:
+def h_contact_percentile_for_edge(edge_m: float) -> float:
+    """Percentile for contact height on large cubes (noisy bottom band); 0 = min(h)."""
+    if abs(float(edge_m) - float(CUBE_SIZE_LARGE_M)) < 1.5e-3:
+        return 3.5
+    return 0.0
+
+
+def icp_refine_cube_pose_cam(
+    pts_cam: numpy.ndarray,
+    t_cam_init: numpy.ndarray,
+    edge_m: float,
+) -> numpy.ndarray:
     """
-    AprilTag / robot world: +Z is up; play mat lies in XY. Snap cube frame so **Z** is
-    world up and **X** is the nearest axis to ±X or ±Y (mat edges), fixing drift from
-    min-area rect on noisy clouds.
+    Refine cube pose in camera frame: register a synthetic ``edge_m`` cube mesh (centered
+    at origin in cube frame) to the measured cluster via Open3D ICP. Handles oblique views
+    without snapping to mat cardinals.
     """
-    R = t_robot[:3, :3].copy()
-    z_w = numpy.array([0.0, 0.0, 1.0], dtype=numpy.float64)
-    xc = R[:, 0]
-    x_proj = xc - numpy.dot(xc, z_w) * z_w
-    nrm = numpy.linalg.norm(x_proj)
-    if nrm < 1e-9:
-        x_proj = numpy.array([1.0, 0.0, 0.0], dtype=numpy.float64)
-    else:
-        x_proj = x_proj / nrm
-    cardinals = (
-        numpy.array([1.0, 0.0, 0.0], dtype=numpy.float64),
-        numpy.array([-1.0, 0.0, 0.0], dtype=numpy.float64),
-        numpy.array([0.0, 1.0, 0.0], dtype=numpy.float64),
-        numpy.array([0.0, -1.0, 0.0], dtype=numpy.float64),
+    em = float(edge_m)
+    T0 = numpy.asarray(t_cam_init, dtype=numpy.float64)
+    if em < 1e-4 or pts_cam.shape[0] < 25:
+        return T0
+    mesh = o3d.geometry.TriangleMesh.create_box(em, em, em)
+    mesh.translate(-numpy.array([em * 0.5, em * 0.5, em * 0.5], dtype=numpy.float64))
+    n_src = min(ICP_MESH_SAMPLES, max(500, int(pts_cam.shape[0] * 30)))
+    source = mesh.sample_points_uniformly(number_of_points=n_src)
+    target = o3d.geometry.PointCloud()
+    target.points = o3d.utility.Vector3dVector(pts_cam.astype(numpy.float64))
+    target_ds = target.voxel_down_sample(voxel_size=ICP_VOXEL_M)
+    if len(target_ds.points) < 20:
+        target_ds = target
+    try:
+        target_ds.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.012, max_nn=30)
+        )
+    except Exception:
+        return T0
+    criteria_coarse = o3d.pipelines.registration.ICPConvergenceCriteria(
+        relative_fitness=1e-6,
+        relative_rmse=1e-6,
+        max_iteration=ICP_COARSE_ITERS,
     )
-    dots = [float(numpy.dot(x_proj, c)) for c in cardinals]
-    x_w = cardinals[int(numpy.argmax(dots))]
-    y_w = numpy.cross(z_w, x_w)
-    y_w = y_w / (numpy.linalg.norm(y_w) + 1e-12)
-    x_w = numpy.cross(y_w, z_w)
-    x_w = x_w / (numpy.linalg.norm(x_w) + 1e-12)
-    R_new = orthonormalize_rotation(numpy.column_stack([x_w, y_w, z_w]))
-    out = numpy.copy(t_robot)
-    out[:3, :3] = R_new
-    return out
+    try:
+        reg1 = o3d.pipelines.registration.registration_icp(
+            source,
+            target_ds,
+            ICP_MAX_CORR_COARSE_M,
+            T0,
+            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+            criteria_coarse,
+        )
+        T1 = numpy.asarray(reg1.transformation, dtype=numpy.float64)
+        if float(reg1.fitness) < ICP_MIN_FITNESS:
+            return T0
+        try:
+            target_ds.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.008, max_nn=25)
+            )
+        except Exception:
+            T = T1
+            T[:3, :3] = orthonormalize_rotation(T[:3, :3])
+            return T
+        criteria_fine = o3d.pipelines.registration.ICPConvergenceCriteria(
+            max_iteration=ICP_FINE_ITERS,
+        )
+        reg2 = o3d.pipelines.registration.registration_icp(
+            source,
+            target_ds,
+            ICP_MAX_CORR_FINE_M,
+            T1,
+            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            criteria_fine,
+        )
+        T = numpy.asarray(reg2.transformation, dtype=numpy.float64)
+        if float(reg2.fitness) < ICP_MIN_FITNESS * 0.85:
+            T = T1
+        T[:3, :3] = orthonormalize_rotation(T[:3, :3])
+        return T
+    except Exception:
+        return T0
 
 
 def refine_cube_pose_bound_center_cam(
@@ -416,7 +419,7 @@ def snap_cube_center_along_plane_normal(
     """
     Move center along the table normal so signed plane distance matches ``h_contact + edge/2``.
     ``h_contact`` is the reference height of the contact patch: ``min(h)`` by default, or
-    ``percentile(h, h_contact_percentile)`` when ``h_contact_percentile > 0`` (large cubes).
+    ``percentile(h, h_contact_percentile)`` when ``h_contact_percentile > 0``.
     """
     pm = flip_plane_to_robot_up(plane_model, camera_pose)
     h_pts = _signed_plane_dist(pts_cam, pm)
@@ -437,40 +440,36 @@ def compute_cube_pose_o2(
     edge_m: float,
 ) -> tuple[numpy.ndarray, numpy.ndarray] | None:
     """
-    Table-plane physical pose with **size-specific** bottom mask, yaw source, iterations,
-    height snap, and refine cycles (see ``CubePoseParams``).
+    Seed pose from ``physical_cube_pose_from_points`` (table plane + footprint), one
+    bound-center + height snap along the plane normal, then **Open3D ICP** (synthetic cube
+    mesh → cloud) for position and orientation at the real camera angle.
     """
     if pts.shape[0] < 30:
         return None
-    p = pose_params_for_nominal_edge(edge_m)
     pair = physical_cube_pose_from_points(
         pts,
         plane_model,
         camera_pose,
         edge_m,
-        bottom_layer_frac=p.bottom_layer_frac,
-        bound_center_iters=p.bound_center_iters,
-        yaw_source=p.yaw_source,
+        yaw_source=PHYSICAL_INIT_YAW_SOURCE,
     )
     if pair is None:
         return None
     _, t_cam = pair
     t_cam = numpy.copy(t_cam)
-    for _ in range(p.refine_snap_cycles):
-        t_cam = refine_cube_pose_bound_center_cam(pts, t_cam, p.extra_bound_iters)
-        c = snap_cube_center_along_plane_normal(
-            t_cam[:3, 3],
-            pts,
-            plane_model,
-            camera_pose,
-            edge_m,
-            h_contact_percentile=p.h_contact_percentile,
-        )
-        t_cam[:3, 3] = c
+    t_cam = refine_cube_pose_bound_center_cam(pts, t_cam, PHYSICAL_INIT_BOUND_EXTRA)
+    c = snap_cube_center_along_plane_normal(
+        t_cam[:3, 3],
+        pts,
+        plane_model,
+        camera_pose,
+        edge_m,
+        h_contact_percentile=h_contact_percentile_for_edge(edge_m),
+    )
+    t_cam[:3, 3] = c
+    t_cam = icp_refine_cube_pose_cam(pts, t_cam, edge_m)
     T_cam_robot = numpy.asarray(camera_pose, dtype=numpy.float64)
     t_robot = numpy.linalg.inv(T_cam_robot) @ t_cam
-    t_robot = snap_cube_pose_to_tag_world_axes(t_robot)
-    t_cam = T_cam_robot @ t_robot
     return t_robot, t_cam
 
 
