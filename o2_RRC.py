@@ -1,13 +1,14 @@
 """
-o2_RRC — challenge 2 (minimal): AprilTag pose (checkpoint0), segment cubes, snap edge
-to 22.5 / 25 / 30 mm, stack at fixed tower XY. Cube orientation uses a **black border**
-hint (dark pixels on the top face) plus PCA / min-area rect fallbacks on bottom-layer points.
+o2_RRC — challenge 2 (minimal): AprilTag (checkpoint0), cluster cubes, snap edge to
+22.5 / 25 / 30 mm. **Cube pose** is ``orientation_RRC.physical_cube_pose_from_points``
+(bottom footprint + min-area rect yaw + bound centering), with per-cube ``edge_m``.
 
-**Route**: After the first good detection pass, cubes are sorted **largest → smallest**
-(nominal edge, then X). That order is fixed for the run. Each pick matches the **next**
-planned center to the **nearest** current detection (no color, no re-planning tiers).
+**Playmat**: Dense points are cropped to the checkpoint8 robot-frame AABB before
+clustering; each cluster median and final pose center must lie in that box (drops
+background / off-mat blobs).
 
-**Grasp**: Yaw snapped to 90° for parallel jaws; simple approach (safe Z → grasp Z).
+**Route**: Largest → smallest (nominal edge, then X); each step matches the planned
+center. **Grasp**: yaw snapped to 90°.
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ from orientation_RRC import (
     CUBE_SIZE_MEDIUM_M,
     CUBE_SIZE_SMALL_M,
     isolate_cube_cluster_open3d,
-    orthonormalize_rotation,
+    physical_cube_pose_from_points,
     points_to_meters_open3d,
     _in_plane_basis,
     _project_points_to_plane,
@@ -82,13 +83,11 @@ TOTAL_CUBES = 9
 GPU_Z_MIN_M = 0.28
 GPU_Z_MAX_M = 1.4
 DENSE_CROP_MARGIN_M = 0.006
-BOTTOM_LAYER_FRAC = 0.18
-REFINE_AABB_ITERS = 18
-REFINE_AABB_ITERS_POST_VERTICAL = 8
 
-# Black cube rim in the left camera image (BGR): use dark samples to pick top-face edge direction
-BLACK_BORDER_GRAY_MAX = 100
-BLACK_BORDER_MIN_POINTS = 14
+# Arena / play mat in robot–world frame (meters), same as checkpoint8 — drops wall / floor beyond mat.
+PLAY_MAT_X_ROBOT_M = (-0.10, 0.52)
+PLAY_MAT_Y_ROBOT_M = (-0.55, 0.55)
+PLAY_MAT_Z_ROBOT_M = (-0.12, 0.48)
 
 # Match live cube to planned step (meters)
 MATCH_MAX_DIST_M = 0.055
@@ -117,7 +116,7 @@ def gpu_depth_mask(point_cloud) -> numpy.ndarray | None:
     return (m.astype(numpy.uint8) * 255)
 
 
-def points_to_scene_meters(point_cloud) -> numpy.ndarray:
+def points_to_scene_meters(point_cloud, camera_pose: numpy.ndarray | None = None) -> numpy.ndarray:
     xyz = point_cloud[..., :3]
     valid = numpy.isfinite(xyz).all(axis=-1)
     mask = gpu_depth_mask(point_cloud)
@@ -129,7 +128,51 @@ def points_to_scene_meters(point_cloud) -> numpy.ndarray:
     if pts.shape[0] < 100:
         return numpy.zeros((0, 3), dtype=numpy.float64)
     pts_m, _ = points_to_meters_open3d(pts)
-    return pts_m.astype(numpy.float64)
+    pts_m = pts_m.astype(numpy.float64)
+    if camera_pose is not None:
+        pts_m = filter_points_playmat_cam_frame(pts_m, camera_pose)
+    return pts_m
+
+
+def filter_points_playmat_cam_frame(pts_m: numpy.ndarray, T_cam_robot: numpy.ndarray) -> numpy.ndarray:
+    """Keep camera-frame points whose robot/world position lies on the play mat (excludes background)."""
+    if pts_m.shape[0] == 0:
+        return pts_m
+    T_robot_cam = numpy.linalg.inv(numpy.asarray(T_cam_robot, dtype=numpy.float64))
+    hom = numpy.ones((pts_m.shape[0], 4), dtype=numpy.float64)
+    hom[:, :3] = pts_m
+    pr = (T_robot_cam @ hom.T).T[:, :3]
+    x0, x1 = PLAY_MAT_X_ROBOT_M
+    y0, y1 = PLAY_MAT_Y_ROBOT_M
+    z0, z1 = PLAY_MAT_Z_ROBOT_M
+    m = (
+        (pr[:, 0] >= x0)
+        & (pr[:, 0] <= x1)
+        & (pr[:, 1] >= y0)
+        & (pr[:, 1] <= y1)
+        & (pr[:, 2] >= z0)
+        & (pr[:, 2] <= z1)
+    )
+    return pts_m[m]
+
+
+def is_center_on_playmat_robot(p_robot_xyz: numpy.ndarray) -> bool:
+    x, y, z = float(p_robot_xyz[0]), float(p_robot_xyz[1]), float(p_robot_xyz[2])
+    x0, x1 = PLAY_MAT_X_ROBOT_M
+    y0, y1 = PLAY_MAT_Y_ROBOT_M
+    z0, z1 = PLAY_MAT_Z_ROBOT_M
+    return (x0 <= x <= x1) and (y0 <= y <= y1) and (z0 <= z <= z1)
+
+
+def cluster_median_robot(
+    pts_cam_m: numpy.ndarray,
+    T_cam_robot: numpy.ndarray,
+) -> numpy.ndarray:
+    T_robot_cam = numpy.linalg.inv(numpy.asarray(T_cam_robot, dtype=numpy.float64))
+    hom = numpy.ones((pts_cam_m.shape[0], 4), dtype=numpy.float64)
+    hom[:, :3] = pts_cam_m
+    pr = (T_robot_cam @ hom.T).T[:, :3]
+    return numpy.median(pr, axis=0)
 
 
 def extract_dense_cluster_points(
@@ -184,189 +227,6 @@ def classify_nominal_edge(
     return snap_edge_to_nominal(pooled)
 
 
-def _refine_center_aabb(pts: numpy.ndarray, R: numpy.ndarray, c0: numpy.ndarray, iters: int) -> numpy.ndarray:
-    c = c0.copy()
-    for _ in range(iters):
-        q = R.T @ (pts - c[None, :]).T
-        delta = numpy.array(
-            [0.5 * (float(numpy.min(q[k])) + float(numpy.max(q[k]))) for k in range(3)],
-            dtype=numpy.float64,
-        )
-        if float(numpy.linalg.norm(delta)) < 1e-8:
-            break
-        c = c + R @ delta
-    return c
-
-
-def _signed_height_point(c: numpy.ndarray, pm: numpy.ndarray) -> float:
-    return float(c[0] * pm[0] + c[1] * pm[1] + c[2] * pm[2] + pm[3])
-
-
-def _bgr_gray_at_cam_points(
-    image_bgra: numpy.ndarray,
-    pts_cam: numpy.ndarray,
-    K: numpy.ndarray,
-) -> numpy.ndarray:
-    """Approx luminance (0–255) at ZED pixels for 3D points in the **camera** frame (meters)."""
-    h, w = image_bgra.shape[:2]
-    K = numpy.asarray(K, dtype=numpy.float64)
-    n = pts_cam.shape[0]
-    g = numpy.full(n, 255.0, dtype=numpy.float64)
-    z = numpy.maximum(pts_cam[:, 2], 1e-9)
-    u = numpy.round(K[0, 0] * pts_cam[:, 0] / z + K[0, 2]).astype(numpy.int32)
-    v = numpy.round(K[1, 1] * pts_cam[:, 1] / z + K[1, 2]).astype(numpy.int32)
-    m = (pts_cam[:, 2] > 1e-7) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
-    if numpy.any(m):
-        bgr = image_bgra[v[m], u[m], :3].astype(numpy.float64)
-        g[m] = 0.114 * bgr[:, 0] + 0.587 * bgr[:, 1] + 0.299 * bgr[:, 2]
-    return g
-
-
-def _x_axis_from_plane_uv(uv: numpy.ndarray) -> numpy.ndarray | None:
-    """Unit direction in plane (coefficients on e1,e2) from min-area rect of 2D points."""
-    if uv.shape[0] < 5:
-        return None
-    rect = cv2.minAreaRect(uv.astype(numpy.float32))
-    box = cv2.boxPoints(rect).astype(numpy.float64)
-    e01 = box[1] - box[0]
-    e12 = box[2] - box[1]
-    n1 = float(numpy.linalg.norm(e01))
-    n2 = float(numpy.linalg.norm(e12))
-    if n1 < 1e-9 and n2 < 1e-9:
-        return None
-    if n1 >= n2:
-        du, dv = e01[0] / n1, e01[1] / n1
-    else:
-        du, dv = e12[0] / n2, e12[1] / n2
-    d = numpy.array([du, dv], dtype=numpy.float64)
-    d /= numpy.linalg.norm(d) + 1e-12
-    return d
-
-
-def _x_axis_from_bottom_pca(u: numpy.ndarray, v: numpy.ndarray) -> numpy.ndarray | None:
-    """Major axis of bottom-layer footprint in plane coordinates (u·e1, u·e2)."""
-    n = u.size
-    if n < 8:
-        return None
-    uv = numpy.stack([u, v], axis=1).astype(numpy.float64)
-    uv -= numpy.mean(uv, axis=0, keepdims=True)
-    c = (uv.T @ uv) / max(1, n - 1)
-    _, vecs = numpy.linalg.eigh(c)
-    major = vecs[:, -1]
-    major /= numpy.linalg.norm(major) + 1e-12
-    return major
-
-
-def _choose_x_axis_bottom_face(
-    pts_cam: numpy.ndarray,
-    bottom_mask: numpy.ndarray,
-    p_plane_all: numpy.ndarray,
-    e1: numpy.ndarray,
-    e2: numpy.ndarray,
-    n: numpy.ndarray,
-    image_bgra: numpy.ndarray | None,
-    K: numpy.ndarray | None,
-) -> numpy.ndarray:
-    """
-    In-plane x axis (3D, unit, orthogonal to n). Prefers **black border** samples
-    in the image; else PCA on full bottom layer; else min-area rect on full bottom UV.
-    """
-    pref = numpy.median(p_plane_all[bottom_mask], axis=0)
-    rel_bot = p_plane_all[bottom_mask] - pref[None, :]
-    u = numpy.dot(rel_bot, e1)
-    v = numpy.dot(rel_bot, e2)
-    uv_bot = numpy.stack([u, v], axis=1)
-
-    du, dv = 1.0, 0.0
-    got = False
-
-    if image_bgra is not None and K is not None:
-        gray = _bgr_gray_at_cam_points(image_bgra, pts_cam, K)
-        dark = bottom_mask & (gray <= float(BLACK_BORDER_GRAY_MAX))
-        if int(numpy.sum(dark)) >= BLACK_BORDER_MIN_POINTS:
-            rel_d = p_plane_all[dark] - numpy.median(p_plane_all[dark], axis=0)[None, :]
-            ud = numpy.dot(rel_d, e1)
-            vd = numpy.dot(rel_d, e2)
-            uvd = numpy.stack([ud, vd], axis=1)
-            xd = _x_axis_from_plane_uv(uvd)
-            if xd is not None:
-                du, dv = float(xd[0]), float(xd[1])
-                got = True
-
-    if not got:
-        x2 = _x_axis_from_bottom_pca(u, v)
-        if x2 is not None:
-            du, dv = float(x2[0]), float(x2[1])
-            got = True
-    if not got:
-        xf = _x_axis_from_plane_uv(uv_bot)
-        if xf is not None:
-            du, dv = float(xf[0]), float(xf[1])
-
-    x_axis = du * e1 + dv * e2
-    x_axis = x_axis - numpy.dot(x_axis, n) * n
-    x_axis = x_axis / (numpy.linalg.norm(x_axis) + 1e-12)
-    return x_axis
-
-
-def precise_cube_pose_nominal(
-    pts: numpy.ndarray,
-    plane_model: numpy.ndarray,
-    camera_pose: numpy.ndarray,
-    edge_m: float,
-    image_bgra: numpy.ndarray | None = None,
-    K: numpy.ndarray | None = None,
-) -> tuple[numpy.ndarray, numpy.ndarray] | None:
-    if pts.shape[0] < 35:
-        return None
-
-    pm = flip_plane_to_robot_up(plane_model, camera_pose)
-    n = pm[:3] / (numpy.linalg.norm(pm[:3]) + 1e-12)
-    e1, e2 = _in_plane_basis(n)
-
-    h = _signed_plane_dist(pts, pm)
-    h_min = float(numpy.min(h))
-    h_max = float(numpy.max(h))
-    if h_max - h_min < 1e-6:
-        return None
-
-    thresh = h_min + BOTTOM_LAYER_FRAC * (h_max - h_min)
-    bottom_mask = h <= thresh
-    if int(numpy.sum(bottom_mask)) < 10:
-        bottom_mask = h <= numpy.percentile(h, 20.0)
-    if int(numpy.sum(bottom_mask)) < 8:
-        bottom_mask = numpy.ones(pts.shape[0], dtype=bool)
-
-    p_plane_all = _project_points_to_plane(pts, pm)
-    p_bot = p_plane_all[bottom_mask]
-    c_bottom = numpy.median(p_bot, axis=0)
-    center = c_bottom + (edge_m * 0.5) * n
-
-    x_axis = _choose_x_axis_bottom_face(
-        pts, bottom_mask, p_plane_all, e1, e2, n, image_bgra, K
-    )
-    y_axis = numpy.cross(n, x_axis)
-    y_axis = y_axis / (numpy.linalg.norm(y_axis) + 1e-12)
-    R = orthonormalize_rotation(numpy.column_stack([x_axis, y_axis, n]))
-
-    c = _refine_center_aabb(pts, R, center, REFINE_AABB_ITERS)
-
-    h_bottom = float(numpy.percentile(h, 6.0))
-    h_target_center = h_bottom + edge_m * 0.5
-    h_c = _signed_height_point(c, pm)
-    c = c + n * (h_target_center - h_c)
-
-    c = _refine_center_aabb(pts, R, c, REFINE_AABB_ITERS_POST_VERTICAL)
-
-    t_cam_cube = numpy.eye(4, dtype=numpy.float64)
-    t_cam_cube[:3, :3] = R
-    t_cam_cube[:3, 3] = c
-
-    t_robot_cam = numpy.linalg.inv(camera_pose)
-    t_robot_cube = t_robot_cam @ t_cam_cube
-    return t_robot_cube, t_cam_cube
-
-
 def dedupe_detections(dets: list[dict]) -> list[dict]:
     if len(dets) <= 1:
         return dets
@@ -390,9 +250,7 @@ def detect_cubes_once(
     if image is None or point_cloud is None:
         return []
 
-    K = numpy.asarray(camera_intrinsic, dtype=numpy.float64) if camera_intrinsic is not None else None
-
-    full_pts_m = points_to_scene_meters(point_cloud)
+    full_pts_m = points_to_scene_meters(point_cloud, camera_pose)
     if full_pts_m.shape[0] < 120:
         return []
 
@@ -405,23 +263,25 @@ def detect_cubes_once(
 
     out: list[dict] = []
     for c in cube_pcds:
+        pts_sparse = numpy.asarray(c.points, dtype=numpy.float64)
+        if pts_sparse.shape[0] < 15:
+            continue
+        if not is_center_on_playmat_robot(cluster_median_robot(pts_sparse, camera_pose)):
+            continue
+
         pts = extract_dense_cluster_points(full_pts_m, c)
         if pts.shape[0] < 35:
-            pts = numpy.asarray(c.points, dtype=numpy.float64)
+            pts = pts_sparse
         if pts.shape[0] < 30:
             continue
         edge_m = classify_nominal_edge(pts, plane_np, camera_pose)
-        pose_pair = precise_cube_pose_nominal(
-            pts,
-            plane_np,
-            camera_pose,
-            edge_m,
-            image_bgra=image,
-            K=K,
-        )
+        pose_pair = physical_cube_pose_from_points(pts, plane_np, camera_pose, edge_m=edge_m)
         if pose_pair is None:
             continue
         t_robot, t_cam = pose_pair
+        ctr = numpy.asarray(t_robot[:3, 3], dtype=numpy.float64)
+        if not is_center_on_playmat_robot(ctr):
+            continue
         out.append({"t_robot": t_robot, "t_cam": t_cam, "edge_m": float(edge_m)})
     return dedupe_detections(out)
 
