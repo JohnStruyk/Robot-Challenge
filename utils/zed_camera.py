@@ -11,6 +11,8 @@ import pyzed.sl as sl
 # This wrapper does not force a mode unless you pass ``depth_mode=`` — otherwise the SDK /
 # ZED Explorer default applies (what you’re seeing as NEURAL).
 
+ZED_WARMUP_GRABS = 15
+
 
 class ZedCamera:
 
@@ -87,7 +89,7 @@ class ZedCamera:
         # Warmup ZED Camera
         self._zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1)
         self._zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
-        for _ in range(int(ZED_WARMUP_GRABS)):
+        for _ in range(ZED_WARMUP_GRABS):
             self._zed.grab(self._runtime_parameters)
 
         # Setup Explosure for Better Image Quality
